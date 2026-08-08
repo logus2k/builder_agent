@@ -1,0 +1,4 @@
+# The Builder core is stdlib-only (subprocess -> opencode, urllib -> reqoach commit). The HTTP
+# service layer is all that needs third-party packages — same as the Planner/Architect.
+fastapi
+uvicorn[standard]

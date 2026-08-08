@@ -52,16 +52,35 @@ def _snapshot(workdir: str) -> dict[str, str]:
     return snap
 
 
-def build_task(task: dict, workdir: str, attach: str | None = None,
+def _instruction(task: dict, target_path: str, action: str, skeleton: dict | None) -> str:
+    """Build opencode's instruction: write/extend a SPECIFIC file at an agent-decided path
+    within the project frame — not a flat basename. Structure is decided upstream (structure.py)."""
+    sk = skeleton or {}
+    frame = ""
+    if sk:
+        frame = (f" This is part of a {sk.get('stack') or sk.get('language','')} project; "
+                 f"follow its conventions ({sk.get('conventions','')}).")
+    title = task.get("title", "")
+    instr = task.get("instructions", "")
+    if action == "extend":
+        return (f"The file '{target_path}' already exists in this project. EXTEND it so it also "
+                f"satisfies: {title}. {instr} Preserve the existing code and integrate cleanly "
+                f"(add to it, do not rewrite unrelated parts).{frame} "
+                f"Write real, working code — no placeholders, TODOs, or mock/simulated logic.")
+    return (f"Create the file at path '{target_path}' (create any directories it needs) with the "
+            f"complete, working implementation for: {title}. {instr}{frame} "
+            f"No placeholders, TODOs, or mock/simulated logic.")
+
+
+def build_task(task: dict, workdir: str, target_path: str, action: str = "create",
+               skeleton: dict | None = None, attach: str | None = None,
                timeout: float = 420) -> tuple[list[str], str]:
-    """Run opencode to produce the task's deliverable in workdir. Returns (changed_files, log).
-    changed_files = files CREATED or MODIFIED during this run (so a shared workspace and tasks
-    that edit an existing file are both supported)."""
+    """Run opencode to produce/extend the task's file at `target_path` (relative to workdir).
+    Returns (changed_files, log) — files CREATED or MODIFIED during this run (so a shared
+    workspace, subdirectories, and tasks that extend an existing file are all supported)."""
     os.makedirs(workdir, exist_ok=True)
     before = _snapshot(workdir)
-    instr = (f"{task['title']}. {task.get('instructions','')} "
-             f"Produce the deliverable file named '{task['deliverable']}' with the complete, "
-             f"working implementation — no placeholders, TODOs, or mock/simulated logic.")
+    instr = _instruction(task, target_path, action, skeleton)
     cmd = [OPENCODE, "run", instr, "--auto", "-m", MODEL, "--dir", workdir]
     if attach:
         cmd += ["--attach", attach]
@@ -76,11 +95,13 @@ def build_task(task: dict, workdir: str, attach: str | None = None,
     return changed, log
 
 
-def build_with_retry(task: dict, workdir: str, retries: int = 2,
+def build_with_retry(task: dict, workdir: str, target_path: str, action: str = "create",
+                     skeleton: dict | None = None, retries: int = 2,
                      attach: str | None = None) -> tuple[list[str], int]:
-    """Retry on no-output (builder flakiness). Returns (new_files, attempts)."""
+    """Retry on no-output (builder flakiness). Returns (changed_files, attempts)."""
     for attempt in range(retries + 1):
-        files, _ = build_task(task, workdir, attach=attach)
+        files, _ = build_task(task, workdir, target_path, action=action,
+                              skeleton=skeleton, attach=attach)
         if files:
             return files, attempt + 1
     return [], retries + 1
