@@ -7,6 +7,7 @@ No Claude, offline-capable — the whole build loop is local.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 
@@ -30,12 +31,34 @@ def list_files(workdir: str, since: set | None = None) -> list[str]:
     return sorted(hits)
 
 
+def _snapshot(workdir: str) -> dict[str, str]:
+    """Map each non-empty, non-hidden file (relative path) to a content hash. Comparing two
+    snapshots detects files that were CREATED *or* EDITED — so a task that appends to an
+    existing deliverable (several tasks can share one file) is not mistaken for 'no output'."""
+    snap: dict[str, str] = {}
+    for root, dirs, files in os.walk(workdir):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+        for f in files:
+            if f.startswith("."):
+                continue
+            p = os.path.join(root, f)
+            try:
+                if os.path.getsize(p) == 0:
+                    continue
+                with open(p, "rb") as fh:
+                    snap[os.path.relpath(p, workdir)] = hashlib.md5(fh.read()).hexdigest()
+            except OSError:
+                continue
+    return snap
+
+
 def build_task(task: dict, workdir: str, attach: str | None = None,
                timeout: float = 420) -> tuple[list[str], str]:
-    """Run opencode to produce the task's deliverable in workdir. Returns (new_files, log).
-    new_files = files that appeared during this run (so a shared workspace is supported)."""
+    """Run opencode to produce the task's deliverable in workdir. Returns (changed_files, log).
+    changed_files = files CREATED or MODIFIED during this run (so a shared workspace and tasks
+    that edit an existing file are both supported)."""
     os.makedirs(workdir, exist_ok=True)
-    before = set(list_files(workdir))
+    before = _snapshot(workdir)
     instr = (f"{task['title']}. {task.get('instructions','')} "
              f"Produce the deliverable file named '{task['deliverable']}' with the complete, "
              f"working implementation — no placeholders, TODOs, or mock/simulated logic.")
@@ -48,7 +71,9 @@ def build_task(task: dict, workdir: str, attach: str | None = None,
         log = (r.stdout or "")[-1500:]
     except subprocess.TimeoutExpired:
         log = "TIMEOUT"
-    return list_files(workdir, since=before), log
+    after = _snapshot(workdir)
+    changed = sorted(rel for rel, sig in after.items() if before.get(rel) != sig)
+    return changed, log
 
 
 def build_with_retry(task: dict, workdir: str, retries: int = 2,

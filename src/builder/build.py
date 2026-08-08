@@ -12,8 +12,29 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.request
 
 from . import opencode, verify
+
+#: The Builder delivers into the project repo's `code/` area — the single-owner layout it shares
+#: with the Analyst (requirements/), Architect (architecture/) and Planner (plans/). reqoach owns
+#: git; the Builder writes files there and asks reqoach to commit (same pattern as the others).
+REPOS_ROOT = os.environ.get("PROJECT_REPOS_ROOT", os.path.expanduser("~/env/project-repos"))
+REQOACH_URL = os.environ.get("REQOACH_URL", "http://localhost:7802").rstrip("/")
+
+
+def repo_code_workspace(pid: str) -> str:
+    """The project repo's `code/` area for project `pid`."""
+    return os.path.join(REPOS_ROOT, pid, "code")
+
+
+def publish_to_repo(pid: str, message: str = "Builder: build code from plan") -> dict:
+    """Ask reqoach to commit the project repo's `code/` area (reqoach owns git)."""
+    body = json.dumps({"area": "code", "agent": "builder", "message": message}).encode()
+    req = urllib.request.Request(f"{REQOACH_URL}/repos/{pid}/commit", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
 
 
 def toposort(tasks: list[dict], edges: list[list[str]]) -> list[dict]:
