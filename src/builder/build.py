@@ -14,7 +14,21 @@ import json
 import os
 import urllib.request
 
-from . import assemble, opencode, structure, verify
+from . import assemble, context, opencode, release, repair, structure, verify
+
+_SKIP_DIRS = {"__pycache__", ".venv_build", ".venv", ".git", ".opencode", "node_modules"}
+
+
+def _list_code_files(ws: str) -> list[str]:
+    """Real source files under the code area (build tooling + release.json excluded)."""
+    out = []
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for f in files:
+            if f == "release.json" or f.endswith(".pyc"):
+                continue
+            out.append(os.path.relpath(os.path.join(root, f), ws))
+    return sorted(out)
 
 #: The Builder delivers into the project repo's `code/` area — the single-owner layout it shares
 #: with the Analyst (requirements/), Architect (architecture/) and Planner (plans/). reqoach owns
@@ -125,15 +139,19 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     log(f"frame: {skeleton.get('stack')} | entrypoint {skeleton.get('entrypoint')} | "
         f"manifest {skeleton.get('manifest')}{' (fallback)' if skeleton.get('_fallback') else ''}")
     cmap = structure.new_map(skeleton)
-    log(f"building {len(order)} feasible tasks into {workspace}")
+
+    # Write the shared BUILD CONTRACTS (AGENTS.md, auto-loaded by opencode) + the custom builder
+    # agent, so every task builds into ONE coherent app in a single continued session.
+    context.write_project_context(workspace, skeleton, handover)
+    log(f"building {len(order)} feasible tasks into {workspace} (one continued session)")
 
     results = []
-    for t in order:
+    for idx, t in enumerate(order):
         placement = structure.place_task(t, cmap, design_hint=_design_hint(t, handover, req_aspect))
         target = placement["path"]
         files, tries = opencode.build_with_retry(
             t, workspace, target, action=placement["action"], skeleton=skeleton,
-            retries=retries, attach=attach)
+            first=(idx == 0), retries=retries, attach=attach)
         if not files:
             v = {"produced": False, "clean": False, "reason": "no output after retries"}
             outcome = "no_output"
@@ -147,31 +165,46 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
                         "outcome": outcome, "tries": tries if files else retries + 1, **v})
         log(f"  [{outcome:9}] {t['task_id']} -> {target}  ({v.get('reason','')})")
 
-    # 2. ASSEMBLE + RUN-VERIFY: manifest + entrypoint, then an honest boot smoke.
+    # 2. ASSEMBLE + RUN-VERIFY + GUARDED REPAIR: ensure a manifest + entrypoint, then boot the app
+    # and repair (guarded) until it runs. All in the same continued session as the build.
     log("assembling: manifest + entrypoint")
     manifest = assemble.ensure_manifest(workspace, skeleton, log=log)
     entry = assemble.ensure_entrypoint(workspace, skeleton, log=log)
-    log("run-verify: compile + install + boot smoke")
-    run = assemble.run_verify(workspace, skeleton, log=log)
-    log(f"run-verify: runnable={run.get('runnable')} "
-        f"(syntax_ok={run.get('syntax_ok')}, deps_installed={run.get('deps_installed')}, "
-        f"boot={run.get('boot')})")
+    log("run-verify + guarded repair")
+    run = repair.run_verify_and_repair(workspace, skeleton, log=log)
+    log(f"run-verify: runnable={run.get('runnable')} repairs={run.get('repairs')} "
+        f"reverts={len(run.get('reverts', []))}"
+        + (f" final_error={run.get('final_error')}" if run.get("runnable") == "no" else ""))
 
     built = sum(1 for r in results if r["outcome"] == "built")
     failed = sum(1 for r in results if r["outcome"] == "failed")
     noout = sum(1 for r in results if r["outcome"] == "no_output")
     judged = built + failed
-    return {
+    report = {
         "workspace": workspace,
         "skeleton": skeleton,
+        "source": plan.get("source", {}),
         "summary": {"total": len(results), "built": built, "failed": failed,
                     "no_output": noout,
                     "build_success_rate": round(built / judged, 3) if judged else None,
-                    "files": len(cmap.get("files", [])),
+                    "files": len(_list_code_files(workspace)),
                     "runnable": run.get("runnable")},
         "assembly": {"manifest": manifest, "entrypoint": entry, "run_verify": run},
         "results": results,
     }
+
+    # 3. RELEASE PACKAGE — the deploy manifest a Deployment Agent consumes; written into code/.
+    code_files = _list_code_files(workspace)
+    rel = release.build_release(report, skeleton, code_files, plan.get("source"))
+    try:
+        with open(os.path.join(workspace, "release.json"), "w", encoding="utf-8") as f:
+            json.dump(rel, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+    report["release"] = rel
+    log(f"release package: runnable={rel.get('runnable')} run='{rel.get('deploy_cmd')}' "
+        f"port={rel.get('port')} files={len(code_files)}")
+    return report
 
 
 def build_plan_file(plan_path: str, workspace: str, **kw) -> dict:

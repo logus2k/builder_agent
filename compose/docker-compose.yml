@@ -1,0 +1,33 @@
+services:
+  builder-agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_UID: "${APP_UID:-1000}"
+        APP_GID: "${APP_GID:-1000}"
+    image: builder-agent:0.1.0
+    container_name: builder-agent
+    restart: unless-stopped
+    # host networking: the shared services (agent_server :7701, llama.cpp :8500, reqoach :7802)
+    # are reached on localhost, same as the Planner/Architect. The service listens on :7806.
+    network_mode: host
+    environment:
+      # Reasoning personas (frame/placement/repair) go through agent_server (house pattern).
+      AGENT_SERVER_URL: "http://localhost:7701"
+      # opencode (the code writer) talks to the same active model directly at llama.cpp :8500.
+      BUILDER_LLM_URL: "http://127.0.0.1:8500"
+      # Publish code into the project repo's code/ area and ask reqoach to commit it.
+      REQOACH_URL: "http://localhost:7802"
+      PROJECT_REPOS_ROOT: "/app/project-repos"
+      BUILDER_DATA_DIR: "/app/data"
+      # opencode resolves ~/.opencode/bin/opencode and ~/.config/opencode/opencode.json under HOME.
+      HOME: "/home/app"
+    volumes:
+      # build reports are the agent's own; survive rebuilds
+      - ../data:/app/data
+      # the per-project git repos (reqoach owns git); the Builder writes code/ here, reqoach commits
+      - /home/logus/env/project-repos:/app/project-repos
+      # the host opencode binary + its model config (carries the temperature=0 build setting), read-only
+      - /home/logus/.opencode:/home/app/.opencode:ro
+      - /home/logus/.config/opencode:/home/app/.config/opencode:ro

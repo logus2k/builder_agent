@@ -62,26 +62,36 @@ def _instruction(task: dict, target_path: str, action: str, skeleton: dict | Non
                  f"follow its conventions ({sk.get('conventions','')}).")
     title = task.get("title", "")
     instr = task.get("instructions", "")
+    # Override any "mock/stub this" wording in the task: an external service must become a REAL,
+    # configurable client/adapter (endpoint + credentials from config/env), never inline fake data.
+    # This keeps the code runnable and free of stub fingerprints even when the plan says "mocked".
+    no_mock = ("If the task mentions mocking, stubbing, or simulating an external service or data, "
+               "do NOT inline a fake — implement a real, configurable client/adapter that reads its "
+               "endpoint/credentials from config or environment and performs the actual call. "
+               "Write real, working code — no placeholders, TODOs, mocks, or simulated logic.")
     if action == "extend":
         return (f"The file '{target_path}' already exists in this project. EXTEND it so it also "
                 f"satisfies: {title}. {instr} Preserve the existing code and integrate cleanly "
-                f"(add to it, do not rewrite unrelated parts).{frame} "
-                f"Write real, working code — no placeholders, TODOs, or mock/simulated logic.")
+                f"(add to it, do not rewrite unrelated parts).{frame} {no_mock}")
     return (f"Create the file at path '{target_path}' (create any directories it needs) with the "
-            f"complete, working implementation for: {title}. {instr}{frame} "
-            f"No placeholders, TODOs, or mock/simulated logic.")
+            f"complete, working implementation for: {title}. {instr}{frame} {no_mock}")
 
 
-def build_task(task: dict, workdir: str, target_path: str, action: str = "create",
-               skeleton: dict | None = None, attach: str | None = None,
-               timeout: float = 420) -> tuple[list[str], str]:
-    """Run opencode to produce/extend the task's file at `target_path` (relative to workdir).
-    Returns (changed_files, log) — files CREATED or MODIFIED during this run (so a shared
-    workspace, subdirectories, and tasks that extend an existing file are all supported)."""
+#: The custom opencode agent (temperature 0, build-focused prompt) written into the workspace by
+#: context.write_project_context. Every task runs as this agent so the build is one coherent persona.
+AGENT = os.environ.get("BUILDER_AGENT_NAME", "builder")
+
+
+def run_opencode(instr: str, workdir: str, first: bool = False, attach: str | None = None,
+                 timeout: float = 420) -> tuple[list[str], str]:
+    """Run one opencode step in the project's CONTINUED session (so it accumulates context of what
+    it already built) as the custom `builder` agent. `first` starts the session; later steps use
+    --continue. Returns (changed_files, log): files created or modified during the step."""
     os.makedirs(workdir, exist_ok=True)
     before = _snapshot(workdir)
-    instr = _instruction(task, target_path, action, skeleton)
-    cmd = [OPENCODE, "run", instr, "--auto", "-m", MODEL, "--dir", workdir]
+    cmd = [OPENCODE, "run", instr, "--auto", "--agent", AGENT, "--dir", workdir]
+    if not first:
+        cmd.append("--continue")           # continue THIS project's session (shared context)
     if attach:
         cmd += ["--attach", attach]
     env = {**os.environ, "PATH": os.path.dirname(OPENCODE) + ":" + os.environ.get("PATH", "")}
@@ -95,13 +105,21 @@ def build_task(task: dict, workdir: str, target_path: str, action: str = "create
     return changed, log
 
 
+def build_task(task: dict, workdir: str, target_path: str, action: str = "create",
+               skeleton: dict | None = None, first: bool = False, attach: str | None = None,
+               timeout: float = 420) -> tuple[list[str], str]:
+    """Produce/extend the task's file at `target_path` in the continued session."""
+    return run_opencode(_instruction(task, target_path, action, skeleton), workdir,
+                        first=first, attach=attach, timeout=timeout)
+
+
 def build_with_retry(task: dict, workdir: str, target_path: str, action: str = "create",
-                     skeleton: dict | None = None, retries: int = 2,
+                     skeleton: dict | None = None, first: bool = False, retries: int = 2,
                      attach: str | None = None) -> tuple[list[str], int]:
-    """Retry on no-output (builder flakiness). Returns (changed_files, attempts)."""
+    """Retry on no-output. Returns (changed_files, attempts). Retries continue the same session."""
     for attempt in range(retries + 1):
-        files, _ = build_task(task, workdir, target_path, action=action,
-                              skeleton=skeleton, attach=attach)
+        files, _ = build_task(task, workdir, target_path, action=action, skeleton=skeleton,
+                              first=first and attempt == 0, attach=attach)
         if files:
             return files, attempt + 1
     return [], retries + 1
