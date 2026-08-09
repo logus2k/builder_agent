@@ -9,7 +9,53 @@ outcomes + run-verify verdict). Project-agnostic — everything derives from the
 
 from __future__ import annotations
 
+import ast
+import os
+
 CONTRACT_VERSION = "1.0"
+
+
+def discover_env(workspace: str, files: list[str]) -> list[str]:
+    """Env vars the built code actually reads — os.environ.get('X'), os.getenv('X'),
+    os.environ['X'] — found by parsing (AST, no regex). Generic: whatever the app needs
+    (DATABASE_URL, LLM_BASE_URL, secrets…) so the Deployment Agent knows what to provide."""
+    found: set[str] = set()
+    for rel in files:
+        if not rel.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(open(os.path.join(workspace, rel), encoding="utf-8").read())
+        except (SyntaxError, OSError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            # os.getenv("X")  or  os.environ.get("X")
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args:
+                a = node.args[0]
+                key = a.value if isinstance(a, ast.Constant) and isinstance(a.value, str) else None
+                if key and node.func.attr == "getenv":
+                    found.add(key)
+                elif key and node.func.attr == "get" and isinstance(node.func.value, ast.Attribute) \
+                        and node.func.value.attr == "environ":
+                    found.add(key)
+            # os.environ["X"]
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) \
+                    and node.value.attr == "environ":
+                idx = node.slice
+                if isinstance(idx, ast.Constant) and isinstance(idx.value, str):
+                    found.add(idx.value)
+            # pydantic-settings: class Settings(BaseSettings): FIELD: type = default  -> FIELD is an env var
+            if isinstance(node, ast.ClassDef) and any(
+                    (isinstance(b, ast.Name) and b.id == "BaseSettings")
+                    or (isinstance(b, ast.Attribute) and b.attr == "BaseSettings") for b in node.bases):
+                for stmt in node.body:                       # class body only (skip nested Config)
+                    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                        found.add(stmt.target.id)
+                    elif isinstance(stmt, ast.Assign):
+                        for t in stmt.targets:
+                            if isinstance(t, ast.Name):
+                                found.add(t.id)
+    found.discard("model_config")   # pydantic v2 settings attribute, not an env var
+    return sorted(found)
 
 
 def _port_from(run_cmd: str, default: int = 8000) -> int:
@@ -21,7 +67,8 @@ def _port_from(run_cmd: str, default: int = 8000) -> int:
     return default
 
 
-def build_release(report: dict, skeleton: dict, files: list[str], project: dict | None = None) -> dict:
+def build_release(report: dict, skeleton: dict, files: list[str], project: dict | None = None,
+                  env: list[str] | None = None) -> dict:
     """Assemble the release package from the build report + frame. `files` are the code/ paths."""
     sk = skeleton or {}
     run_cmd = sk.get("run_cmd") or ""
@@ -49,7 +96,7 @@ def build_release(report: dict, skeleton: dict, files: list[str], project: dict 
         "run_cmd": run_cmd,
         "deploy_cmd": deploy_cmd,
         "port": port,
-        "env": [],                         # future: infer required env vars from config usage
+        "env": env or [],                  # env vars the built code reads (discovered from the code)
         "runnable": summary.get("runnable"),
         "build": {
             "built": summary.get("built"), "failed": summary.get("failed"),

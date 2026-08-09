@@ -13,6 +13,7 @@ Python only for now (other languages report runnable="unknown" honestly, like as
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import subprocess
@@ -22,6 +23,13 @@ import urllib.error
 import urllib.request
 
 from . import context, opencode
+
+#: Cached venvs (keyed by manifest content hash) live here, OUTSIDE the workspace, so they persist
+#: across builds and are never committed to the repo. Creating a venv + full reinstall every build
+#: is the run-verify tail; a warm cache turns it into a fast pip "already satisfied" check.
+_VENV_CACHE = os.path.join(
+    os.environ.get("BUILDER_DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "data")),
+    "venvs")
 
 SKIP = {"__pycache__", ".venv_build", ".venv", "venv", ".git", "node_modules",
         "site-packages", ".opencode"}
@@ -43,13 +51,27 @@ def _as_module(rel: str) -> str:
 
 
 def _count_importable(py: str, ws: str) -> int:
-    return sum(subprocess.run([py, "-c", f"import {_as_module(r)}"], cwd=ws,
-                              capture_output=True).returncode == 0 for r in _src_files(ws))
+    """How many source modules import cleanly — the regression health signal. One subprocess
+    (not one per file) to keep the loop cheap over many files × rounds."""
+    mods = [_as_module(r) for r in _src_files(ws)]
+    if not mods:
+        return 0
+    script = ("import importlib\nok=0\nfor m in %r:\n"
+              "    try:\n        importlib.import_module(m); ok+=1\n"
+              "    except Exception:\n        pass\nprint(ok)" % mods)
+    r = subprocess.run([py, "-c", script], cwd=ws, capture_output=True, text=True)
+    try:
+        return int((r.stdout or "0").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 def _all_compile(py: str, ws: str) -> bool:
-    return all(subprocess.run([py, "-m", "py_compile", r], cwd=ws,
-                              capture_output=True).returncode == 0 for r in _src_files(ws))
+    """Syntax gate — compile every source file in ONE call."""
+    files = _src_files(ws)
+    if not files:
+        return True
+    return subprocess.run([py, "-m", "py_compile", *files], cwd=ws, capture_output=True).returncode == 0
 
 
 def _snapshot(ws: str) -> dict:
@@ -108,13 +130,26 @@ def _repair(ws: str, rel: str | None, err: str, entry: str) -> None:
 
 
 def _make_venv(ws: str, manifest: str | None, log) -> str | None:
-    venv = os.path.join(ws, ".venv_build")
-    try:
-        subprocess.run([sys.executable, "-m", "venv", venv], capture_output=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log(f"  run-verify: venv failed ({type(e).__name__}); skipping"); return None
-    py = os.path.join(venv, "bin", "python")
+    """A venv with the project's deps — CACHED by the manifest's content hash and reused across
+    builds. Creating a venv + reinstalling on every build is the run-verify tail; here it's a
+    one-time cost per distinct manifest, then a fast pip 'already satisfied' verify."""
     mpath = os.path.join(ws, manifest) if manifest else None
+    try:
+        mtext = open(mpath).read() if (mpath and os.path.isfile(mpath)) else ""
+    except OSError:
+        mtext = ""
+    key = hashlib.md5(mtext.encode()).hexdigest()[:12]
+    venv = os.path.join(_VENV_CACHE, key)
+    py = os.path.join(venv, "bin", "python")
+    if not os.path.exists(py):
+        os.makedirs(_VENV_CACHE, exist_ok=True)
+        try:
+            subprocess.run([sys.executable, "-m", "venv", venv], capture_output=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"  run-verify: venv create failed ({type(e).__name__})"); return None
+        log(f"  run-verify: new venv (manifest {key})")
+    else:
+        log(f"  run-verify: reusing cached venv ({key})")
     if mpath and os.path.isfile(mpath):
         r = subprocess.run([os.path.join(venv, "bin", "pip"), "install", "-q", "-r", mpath],
                            capture_output=True, text=True, timeout=600)
@@ -123,7 +158,7 @@ def _make_venv(ws: str, manifest: str | None, log) -> str | None:
     return py
 
 
-def run_verify_and_repair(ws: str, skeleton: dict, max_rounds: int = 6, log=print) -> dict:
+def run_verify_and_repair(ws: str, skeleton: dict, max_rounds: int = 5, log=print) -> dict:
     """Boot the built app; guardedly repair until it runs. Returns a report dict."""
     lang = (skeleton.get("language") or "python").lower()
     entry = context.entrypoint_module(skeleton)
@@ -134,6 +169,17 @@ def run_verify_and_repair(ws: str, skeleton: dict, max_rounds: int = 6, log=prin
     py = _make_venv(ws, skeleton.get("manifest"), log)
     if not py:
         return {"language": lang, "entry": entry, "runnable": "unknown", "note": "no venv"}
+
+    manifest = skeleton.get("manifest") or "requirements.txt"
+    mpath = os.path.join(ws, manifest)
+
+    def _manifest_text():
+        try:
+            return open(mpath).read()
+        except OSError:
+            return ""
+
+    last_manifest = _manifest_text()
 
     rounds, reverts, stuck = 0, [], {}
     final_err = ""
@@ -148,10 +194,17 @@ def run_verify_and_repair(ws: str, skeleton: dict, max_rounds: int = 6, log=prin
         final_err = err
         rel, sig = _offender(ws, err), _signature(err)
         log(f"  run-verify round {rnd}: offender={rel} :: {sig}")
-        if stuck.get(sig, 0) >= 2:
+        if stuck.get(sig, 0) >= 3:
             log("  run-verify: no progress; stopping"); break
         snap, before = _snapshot(ws), _count_importable(py, ws)
         _repair(ws, rel, err, entry); rounds += 1
+        # A repair may fix a MISSING DEPENDENCY by adding it to the manifest — that can only take
+        # effect if we reinstall (editing .py files never installs a package). Reinstall on change.
+        if _manifest_text() != last_manifest:
+            last_manifest = _manifest_text()
+            subprocess.run([os.path.join(os.path.dirname(py), "pip"), "install", "-q", "-r", mpath],
+                           capture_output=True, timeout=600)
+            log("  reinstalled deps (manifest changed by repair)")
         if not _all_compile(py, ws):
             _restore(ws, snap); reverts.append({"round": rnd, "why": "syntax"}); stuck[sig] = stuck.get(sig, 0) + 1
             log("  reverted: introduced a SyntaxError"); continue

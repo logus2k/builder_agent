@@ -106,14 +106,27 @@ def _safe_rel(path: str) -> str:
 
 
 def new_map(skeleton: dict) -> dict:
-    return {"skeleton": skeleton, "files": []}
+    #: `concepts` maps a canonical concept key -> the file that owns it, so all tasks about the
+    #: same concept (even from different requirements, under different deliverable names) land in
+    #: ONE file — the fix for duplicate divergently-named implementations (e.g. contact_submission).
+    return {"skeleton": skeleton, "files": [], "concepts": {}}
+
+
+def _concept_key(c: str) -> str:
+    """Normalize a concept name to a match key (lower, non-alnum -> _). The SEMANTIC judgment is
+    the model's (it names the concept); this only canonicalizes the key for exact matching."""
+    key = "".join(ch if ch.isalnum() else "_" for ch in (c or "").strip().lower()).strip("_")
+    while "__" in key:
+        key = key.replace("__", "_")
+    return key
 
 
 def _files_view(cmap: dict) -> str:
     files = cmap.get("files", [])
     if not files:
         return "(none yet)"
-    return "\n".join(f"- {f['path']}: {f.get('purpose','')}" for f in files)
+    return "\n".join(f"- {f['path']} [concept: {f.get('concept','')}]: {f.get('purpose','')}"
+                     for f in files)
 
 
 def place_task(task: dict, cmap: dict, design_hint: str = "") -> dict:
@@ -133,8 +146,21 @@ def place_task(task: dict, cmap: dict, design_hint: str = "") -> dict:
             f"  instructions: {task.get('instructions') or ''}\n\n"
             f"Decide its path and action.")
     out = client.complete_json(PLACER_AGENT, user) or {}
+    concept = _concept_key(out.get("concept", ""))
     path = _safe_rel(out.get("path", ""))
     action = out.get("action") if out.get("action") in ("create", "extend") else None
+
+    # CONCEPT+LAYER REGISTRY (deterministic consolidation): key on the concept AND the layer
+    # (the proposed path's directory, e.g. app/schemas vs app/services vs app/routers). Two tasks
+    # about the SAME concept in the SAME layer are the same file — this collapses two requirements'
+    # rival schema definitions (contact_submission) into ONE schema file, fixing the divergent-name
+    # bug — while still keeping a concept's schema, service and router in their proper separate files.
+    layer = "/".join(path.split("/")[:-1])
+    reg_key = f"{concept}::{layer}"
+    registry = cmap.setdefault("concepts", {})
+    if concept and reg_key in registry:
+        path, action = registry[reg_key], "extend"
+
     if not path:
         # Explicit fallback: place by kind under the frame (safety net for an LLM miss).
         kind = (task.get("kind") or "code").lower()
@@ -151,6 +177,8 @@ def place_task(task: dict, cmap: dict, design_hint: str = "") -> dict:
     else:
         action = action or "create"
         cmap["files"].append({"path": path, "purpose": task.get("title", ""),
-                              "task_ids": [task.get("task_id")]})
+                              "concept": concept, "task_ids": [task.get("task_id")]})
+    if concept and reg_key not in registry:      # first file to own this (concept, layer)
+        registry[reg_key] = path
     return {"task_id": task.get("task_id"), "path": path, "action": action,
-            "rationale": (out.get("rationale") or "")}
+            "concept": concept, "rationale": (out.get("rationale") or "")}

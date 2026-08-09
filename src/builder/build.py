@@ -195,7 +195,8 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
 
     # 3. RELEASE PACKAGE — the deploy manifest a Deployment Agent consumes; written into code/.
     code_files = _list_code_files(workspace)
-    rel = release.build_release(report, skeleton, code_files, plan.get("source"))
+    env = release.discover_env(workspace, code_files)
+    rel = release.build_release(report, skeleton, code_files, plan.get("source"), env=env)
     try:
         with open(os.path.join(workspace, "release.json"), "w", encoding="utf-8") as f:
             json.dump(rel, f, ensure_ascii=False, indent=1)

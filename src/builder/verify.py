@@ -61,29 +61,36 @@ def _parses(path: str) -> tuple[bool, str]:
     return True, "n/a"  # no parser for this type -> not a failure
 
 
-def stub_hits(path: str, title: str, kind: str, deliverable: str) -> int:
+def stub_hits(path: str, title: str, kind: str, deliverable: str) -> tuple[int, int]:
+    """Return (hard, soft). HARD = genuine incompleteness (TODO / NotImplementedError /
+    placeholder) — a real defect. SOFT = words like mock/simulate/dummy that ALSO occur in
+    perfectly real code (a configurable adapter's 'simulated mode' fallback message, a test
+    double, a docstring). SOFT is advisory only — it must NOT fail a task, or every real
+    external-service client gets punished for mentioning the word."""
     try:
         body = open(path).read()
     except Exception:  # noqa: BLE001
-        return 0
-    n = len(_HARD.findall(body))
-    if not _is_definitional(title, kind, deliverable):
-        n += len(_SOFT.findall(body))
-    return n
+        return 0, 0
+    hard = len(_HARD.findall(body))
+    soft = 0 if _is_definitional(title, kind, deliverable) else len(_SOFT.findall(body))
+    return hard, soft
 
 
 def verify(task: dict, files: list[str], workdir: str) -> dict:
-    """Verify the task's deliverable. Returns a structured verdict."""
+    """Verify the task's deliverable. A task is clean if it PARSES and has no genuine-incompleteness
+    (HARD) markers. SOFT fingerprints are reported as an advisory flag, never a failure — the
+    authoritative 'it actually works' signal is run-verify (the whole app imports + serves)."""
     deliverable = task.get("deliverable", "")
     dfile = find_deliverable(files, workdir, deliverable)
     if dfile is None:
-        return {"produced": False, "parses": False, "stub_hits": 0, "clean": False,
+        return {"produced": False, "parses": False, "stub_hits": 0, "soft_flags": 0, "clean": False,
                 "reason": "deliverable not produced", "deliverable_file": None}
     path = os.path.join(workdir, dfile)
     parses, pdetail = _parses(path)
-    stubs = stub_hits(path, task.get("title", ""), task.get("kind", ""), deliverable)
-    clean = bool(parses and stubs < STUB_THRESHOLD)
+    hard, soft = stub_hits(path, task.get("title", ""), task.get("kind", ""), deliverable)
+    clean = bool(parses and hard < STUB_THRESHOLD)
     reason = "clean" if clean else (
-        "does not parse" if not parses else f"stub fingerprints ({stubs})")
+        "does not parse" if not parses else f"incomplete: {hard} stub markers")
     return {"produced": True, "parses": parses, "parse_detail": pdetail,
-            "stub_hits": stubs, "clean": clean, "reason": reason, "deliverable_file": dfile}
+            "stub_hits": hard, "soft_flags": soft, "clean": clean, "reason": reason,
+            "deliverable_file": dfile}
