@@ -129,22 +129,26 @@ def _files_view(cmap: dict) -> str:
                      for f in files)
 
 
-def place_task(task: dict, cmap: dict, design_hint: str = "") -> dict:
+def place_task(task: dict, cmap: dict, design_hint: str = "", concept_vocab: list | None = None) -> dict:
     """Decide THIS task's file path + action (builder_task_placer persona) against the living
     map, then update the map. `design_hint` carries the Architect design element(s) this task
-    realizes — reference, not prescription. Returns {task_id, path, action, rationale}.
-    Degrades to a frame-consistent default path."""
+    realizes — reference, not prescription. `concept_vocab` is the canonical concept list (from the
+    architecture) so concept keys stay stable across the whole plan and same-concept tasks collapse.
+    Returns {task_id, path, action, concept, rationale}. Degrades to a frame-consistent default."""
     sk = cmap["skeleton"]
     hint = (f"\nARCHITECTURE REFERENCE (inspiration, not prescription — you decide the code "
             f"layout):\n{design_hint}\n") if design_hint else ""
+    vocab = (f"\nCANONICAL CONCEPTS (when THIS task is about one of these, use that EXACT concept "
+             f"name — do not paraphrase; only invent a new concept if none fits):\n  "
+             f"{', '.join(concept_vocab)}\n") if concept_vocab else ""
     user = (f"PROJECT FRAME:\n  language: {sk.get('language')}\n  stack: {sk.get('stack')}\n"
             f"  layout: {sk.get('layout')}\n  entrypoint: {sk.get('entrypoint')}\n"
             f"  conventions: {sk.get('conventions')}\n\n"
-            f"FILES PLACED SO FAR:\n{_files_view(cmap)}\n{hint}\n"
+            f"FILES PLACED SO FAR:\n{_files_view(cmap)}\n{hint}{vocab}\n"
             f"THIS TASK:\n  id: {task.get('task_id')}\n  kind: {task.get('kind')}\n"
             f"  title: {task.get('title')}\n  wants deliverable: {task.get('deliverable')}\n"
             f"  instructions: {task.get('instructions') or ''}\n\n"
-            f"Decide its path and action.")
+            f"Decide its concept, path and action.")
     out = client.complete_json(PLACER_AGENT, user) or {}
     concept = _concept_key(out.get("concept", ""))
     path = _safe_rel(out.get("path", ""))

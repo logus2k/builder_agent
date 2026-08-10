@@ -80,17 +80,18 @@ class JobManager:
             # Build into the repo's code/ area (same repo the other agents publish to).
             workspace = build_mod.repo_code_workspace(job.project_id)
 
-            # opencode's per-task log lines drive the progress bar. The first line is
-            # "building N feasible tasks into <ws>"; each task then logs "  [outcome] TASK ...".
+            # The build log drives the progress bar. Two-phase build: it logs
+            # "placed N tasks into M files" (M = total to generate), then one "[outcome] path (…)"
+            # line per FILE as it is generated.
             counter = {"done": 0, "total": 0}
 
             def _log(msg: str = "") -> None:
-                s = str(msg)
-                st = s.strip()
-                if st.startswith("building ") and "feasible task" in st:
+                st = str(msg).strip()
+                if st.startswith("placed ") and "into" in st and "file" in st:
                     parts = st.split()
-                    if len(parts) > 1 and parts[1].isdigit():
-                        counter["total"] = int(parts[1])
+                    if "into" in parts:
+                        n = parts[parts.index("into") + 1]
+                        counter["total"] = int(n) if n.isdigit() else counter["total"]
                     job.progress = {"stage": "build", "status": "progress",
                                     "done": 0, "total": counter["total"]}
                 elif st.startswith("["):

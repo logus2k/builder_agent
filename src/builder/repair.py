@@ -22,7 +22,12 @@ import time
 import urllib.error
 import urllib.request
 
-from . import context, opencode
+from . import client, context, opencode
+
+#: The fix-planner persona: given the failing state, concludes ALL fixes (boot errors + incomplete
+#: files) and returns concrete scoped fix-tasks. This is the agentic repair — it reasons about what
+#: is missing/wrong across the whole app, not one traceback line at a time.
+FIX_PLANNER = "builder_fix_planner"
 
 #: Cached venvs (keyed by manifest content hash) live here, OUTSIDE the workspace, so they persist
 #: across builds and are never committed to the repo. Creating a venv + full reinstall every build
@@ -72,6 +77,21 @@ def _all_compile(py: str, ws: str) -> bool:
     if not files:
         return True
     return subprocess.run([py, "-m", "py_compile", *files], cwd=ws, capture_output=True).returncode == 0
+
+
+def _nonparsing(py: str, ws: str) -> set:
+    """The SET of source files that fail to compile. The syntax guard must revert only when a round
+    introduces a NEW parse error — an artifact often starts with pre-existing non-parsing files
+    (incomplete/garbled generations), and a whole-tree 'does everything compile?' gate would then
+    revert EVERY repair round (nothing ever compiles), silently defeating the loop. One subprocess."""
+    files = _src_files(ws)
+    if not files:
+        return set()
+    script = ("import py_compile\nbad=[]\nfor f in %r:\n"
+              "    try: py_compile.compile(f, doraise=True)\n"
+              "    except Exception: bad.append(f)\nprint(chr(10).join(bad))" % files)
+    r = subprocess.run([py, "-c", script], cwd=ws, capture_output=True, text=True)
+    return {x for x in (r.stdout or "").splitlines() if x}
 
 
 def _snapshot(ws: str) -> dict:
@@ -197,6 +217,7 @@ def run_verify_and_repair(ws: str, skeleton: dict, max_rounds: int = 5, log=prin
         if stuck.get(sig, 0) >= 3:
             log("  run-verify: no progress; stopping"); break
         snap, before = _snapshot(ws), _count_importable(py, ws)
+        bad_before = _nonparsing(py, ws)
         _repair(ws, rel, err, entry); rounds += 1
         # A repair may fix a MISSING DEPENDENCY by adding it to the manifest — that can only take
         # effect if we reinstall (editing .py files never installs a package). Reinstall on change.
@@ -205,7 +226,7 @@ def run_verify_and_repair(ws: str, skeleton: dict, max_rounds: int = 5, log=prin
             subprocess.run([os.path.join(os.path.dirname(py), "pip"), "install", "-q", "-r", mpath],
                            capture_output=True, timeout=600)
             log("  reinstalled deps (manifest changed by repair)")
-        if not _all_compile(py, ws):
+        if _nonparsing(py, ws) - bad_before:      # revert only on a NEW parse error, not pre-existing
             _restore(ws, snap); reverts.append({"round": rnd, "why": "syntax"}); stuck[sig] = stuck.get(sig, 0) + 1
             log("  reverted: introduced a SyntaxError"); continue
         after = _count_importable(py, ws)
@@ -239,6 +260,11 @@ def server_smoke(py: str, ws: str, skeleton: dict, wait: float = 8.0, log=print)
     target = next((t for t in run_cmd.split() if ":" in t and "/" not in t and "//" not in t), None)
     if not target:
         return {"attempted": False, "reason": "no app target (module:app) in run_cmd"}
+    # The manifest often omits uvicorn (it's a CLI runner, not an imported dependency), so ensure
+    # it's installed in the venv before trying to actually start the server for the smoke test.
+    if subprocess.run([py, "-c", "import uvicorn"], capture_output=True).returncode != 0:
+        subprocess.run([os.path.join(os.path.dirname(py), "pip"), "install", "-q", "uvicorn"],
+                       capture_output=True, timeout=180)
     uvicorn_bin = os.path.join(os.path.dirname(py), "uvicorn")
     base = [uvicorn_bin] if os.path.exists(uvicorn_bin) else [py, "-m", "uvicorn"]
     port = _free_port()
@@ -273,3 +299,121 @@ def server_smoke(py: str, ws: str, skeleton: dict, wait: float = 8.0, log=print)
 
 def _cleanup(ws: str) -> None:
     subprocess.run(["rm", "-rf", os.path.join(ws, ".venv_build")], capture_output=True)
+
+
+# --------------------------------------------------------------------------------------------- #
+# Agentic repair: assess the WHOLE failing state -> conclude all fixes -> dispatch -> re-verify. #
+# --------------------------------------------------------------------------------------------- #
+def _tree(ws: str) -> str:
+    return "\n".join(_src_files(ws))
+
+
+def _failing_context(py: str, ws: str, boot_err: str, results, budget: int = 16000) -> str:
+    """Full content of the files most likely responsible — the boot-error location, any file that
+    does not parse, and files flagged incomplete. Bounded to the slot by prioritising the error
+    location + non-parsing files (intelligent reduction, not blind truncation)."""
+    ordered, seen = [], set()
+    off = _offender(ws, boot_err)
+    if off:
+        ordered.append((off, "boot-error location")); seen.add(off)
+    for rel in _src_files(ws):
+        if rel in seen:
+            continue
+        if subprocess.run([py, "-m", "py_compile", rel], cwd=ws, capture_output=True).returncode != 0:
+            ordered.append((rel, "does not parse")); seen.add(rel)
+    for res in (results or []):
+        p = res.get("path")
+        if res.get("outcome") == "failed" and p and p not in seen:
+            ordered.append((p, f"flagged: {res.get('reason', '')}")); seen.add(p)
+    out, used = [], 0
+    for rel, tag in ordered:
+        try:
+            content = open(os.path.join(ws, rel), encoding="utf-8").read()
+        except OSError:
+            continue
+        block = f"### {rel} ({tag}) ###\n{content}"
+        if used + len(block) > budget and out:
+            out.append(f"... ({len(ordered) - len(out)} more failing files omitted for size)")
+            break
+        out.append(block); used += len(block)
+    return "\n\n".join(out) or "(no failing-file content available)"
+
+
+def run_verify_and_fix(ws: str, skeleton: dict, results=None, max_rounds: int = 6, log=print) -> dict:
+    """Agentic repair loop: boot the app -> a fix-planner concludes ALL remaining issues (boot
+    errors AND incomplete files) -> dispatch each scoped fix (opencode) -> re-boot, until it runs
+    or converges. Guarded (syntax gate, revert-on-regression, no-progress bound). Stack-agnostic:
+    it reasons over the actual errors + code, so it holds on any project."""
+    lang = (skeleton.get("language") or "python").lower()
+    entry = context.entrypoint_module(skeleton)
+    if lang != "python" or not entry:
+        return {"language": lang, "entry": entry, "runnable": "unknown",
+                "note": f"run-verify not implemented for language={lang!r}, entry={entry!r}"}
+    py = _make_venv(ws, skeleton.get("manifest"), log)
+    if not py:
+        return {"language": lang, "entry": entry, "runnable": "unknown", "note": "no venv"}
+    manifest = skeleton.get("manifest") or "requirements.txt"
+    mpath = os.path.join(ws, manifest)
+
+    def _mtext():
+        try:
+            return open(mpath).read()
+        except OSError:
+            return ""
+
+    last_m = _mtext()
+    total_fixes, stuck, err = 0, {}, ""
+    for rnd in range(1, max_rounds + 1):
+        ok, err = _boot(py, ws, entry)
+        if ok:
+            log(f"  fix-loop: BOOT OK (entry {entry}, {rnd - 1} rounds, {total_fixes} fixes)")
+            smoke = server_smoke(py, ws, skeleton, log=log)
+            _cleanup(ws)
+            return {"language": "python", "entry": entry, "runnable": "yes",
+                    "fix_rounds": rnd - 1, "fixes": total_fixes, "server_smoke": smoke}
+        sig = _signature(err)
+        if stuck.get(sig, 0) >= 2:
+            log("  fix-loop: no progress on this error; stopping"); break
+
+        # ASSESS: the fix-planner concludes ALL fixes from the whole failing state.
+        ctx = _failing_context(py, ws, err, results if rnd == 1 else None)
+        user = (f"The app does not run.\n\nBOOT ERROR (import {entry}):\n{err[-1800:]}\n\n"
+                f"PROJECT FILES:\n{_tree(ws)}\n\nRELEVANT FILE CONTENTS:\n{ctx}\n\n"
+                f"List the concrete fixes that TOGETHER make the app import and run.")
+        plan = client.complete_json(FIX_PLANNER, user) or {}
+        fixes = [f for f in (plan.get("fixes") or []) if isinstance(f, dict) and f.get("instruction")]
+        if not fixes:
+            log("  fix-loop: planner returned no fixes; stopping"); break
+        log(f"  fix-round {rnd}: {len(fixes)} fix task(s) :: {sig[:80]}")
+
+        # DISPATCH each scoped fix (opencode, in the continued session).
+        snap, before = _snapshot(ws), _count_importable(py, ws)
+        bad_before = _nonparsing(py, ws)
+        for f in fixes:
+            files = ", ".join(f.get("files") or []) or "the relevant file(s)"
+            instr = (f"Fix {files} so the app runs: {f.get('instruction')}. Make the MINIMAL change; "
+                     f"do not rewrite unrelated code; keep every file importable. Follow AGENTS.md.")
+            opencode.run_opencode(instr, ws, first=False)
+            total_fixes += 1
+        if _mtext() != last_m:                          # a fix changed the manifest -> reinstall
+            last_m = _mtext()
+            subprocess.run([os.path.join(os.path.dirname(py), "pip"), "install", "-q", "-r", mpath],
+                           capture_output=True, timeout=600)
+            log("  reinstalled deps (manifest changed)")
+
+        # GUARDS: NEW-parse-error gate (baseline-aware) + revert-on-regression + no-progress.
+        new_bad = _nonparsing(py, ws) - bad_before
+        if new_bad:
+            _restore(ws, snap); stuck[sig] = stuck.get(sig, 0) + 1
+            log(f"  reverted round: introduced a SyntaxError in {sorted(new_bad)}"); continue
+        after = _count_importable(py, ws)
+        if after < before:
+            _restore(ws, snap); stuck[sig] = stuck.get(sig, 0) + 1
+            log(f"  reverted round: regression (importable {before}->{after})"); continue
+        _, err2 = _boot(py, ws, entry)
+        if _signature(err2) == sig:
+            stuck[sig] = stuck.get(sig, 0) + 1
+
+    _cleanup(ws)
+    return {"language": "python", "entry": entry, "runnable": "no",
+            "fix_rounds": total_fixes, "final_error": _signature(err)}

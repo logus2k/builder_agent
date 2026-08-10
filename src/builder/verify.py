@@ -6,10 +6,17 @@ mock ships beside it (HARD vs SOFT signals). Ported from the validated planner p
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import py_compile
 import re
+import sys
+
+#: Python's own standard-library top-level module names — anything imported that is NOT here, NOT
+#: an internal package, and NOT a relative import is a THIRD-PARTY dependency the design must have
+#: sanctioned. (3.10+; empty on older runtimes -> conformance simply no-ops, never false-positives.)
+_STDLIB = getattr(sys, "stdlib_module_names", frozenset())
 
 # HARD = incomplete deliverable (always disqualifies). SOFT = fake implementation
 # (disqualifies an implementation, harmless for a definitional deliverable).
@@ -76,10 +83,61 @@ def stub_hits(path: str, title: str, kind: str, deliverable: str) -> tuple[int, 
     return hard, soft
 
 
-def verify(task: dict, files: list[str], workdir: str) -> dict:
-    """Verify the task's deliverable. A task is clean if it PARSES and has no genuine-incompleteness
-    (HARD) markers. SOFT fingerprints are reported as an advisory flag, never a failure — the
-    authoritative 'it actually works' signal is run-verify (the whole app imports + serves)."""
+def _third_party_tops(path: str, internal_tops: set) -> set:
+    """Top-level THIRD-PARTY modules a Python file imports: not stdlib, not an internal workspace
+    package, not a relative import. AST-based (lexical fact, no regex). Empty on any parse error."""
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except (SyntaxError, OSError, ValueError):
+        return set()
+    tops = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            tops.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            tops.add(node.module.split(".")[0])
+    return {t for t in tops if t and t not in _STDLIB and t not in (internal_tops or set())}
+
+
+def _norm_pkg(n: str) -> str:
+    """Normalize a package/module name for matching: lowercase, '-'->'_', drop a 'python_' prefix.
+    (PyPI distribution names and import names differ — 'python-jose' imports as 'jose',
+    'python-multipart' as 'multipart' — so we compare on a normalized form, not raw strings.)"""
+    n = (n or "").strip().lower().replace("-", "_")
+    return n[7:] if n.startswith("python_") else n
+
+
+def unsanctioned_deps(path: str, sanctioned, internal_tops: set) -> list[str]:
+    """Third-party imports NOT in the design-sanctioned dependency set. This is the CONFORMANCE
+    check: the design decides the stack (top-down); code that reaches for a library nobody
+    sanctioned — an ORM in a store-some-rows app — is a review failure, not an accepted build.
+    `sanctioned=None` means 'no policy declared' -> the check no-ops (never false-positives).
+
+    Matching tolerates the PyPI-name vs import-name gap: a sanctioned dist contributes both its
+    normalized name AND its first namespace segment (so 'google-auth-oauthlib' admits `google`),
+    and an import is allowed if its normalized name or first segment is sanctioned."""
+    if sanctioned is None or not path.endswith(".py"):
+        return []
+    allowed = set()
+    for s in sanctioned:
+        n = _norm_pkg(s)
+        if n:
+            allowed.add(n)
+            allowed.add(n.split("_")[0])
+    out = []
+    for t in _third_party_tops(path, internal_tops):
+        n = _norm_pkg(t)
+        if n not in allowed and n.split("_")[0] not in allowed:
+            out.append(t)
+    return sorted(out)
+
+
+def verify(task: dict, files: list[str], workdir: str, sanctioned=None,
+           internal_tops: set | None = None) -> dict:
+    """Verify the task's deliverable. A task is clean if it PARSES, has no genuine-incompleteness
+    (HARD) markers, AND (when a dependency policy is declared) imports ONLY design-sanctioned
+    third-party libraries. SOFT fingerprints are advisory. The authoritative 'it actually works'
+    signal is still run-verify; this adds the missing 'does it even BELONG' signal."""
     deliverable = task.get("deliverable", "")
     dfile = find_deliverable(files, workdir, deliverable)
     if dfile is None:
@@ -88,9 +146,12 @@ def verify(task: dict, files: list[str], workdir: str) -> dict:
     path = os.path.join(workdir, dfile)
     parses, pdetail = _parses(path)
     hard, soft = stub_hits(path, task.get("title", ""), task.get("kind", ""), deliverable)
-    clean = bool(parses and hard < STUB_THRESHOLD)
+    unsanctioned = unsanctioned_deps(path, sanctioned, internal_tops or set())
+    clean = bool(parses and hard < STUB_THRESHOLD and not unsanctioned)
     reason = "clean" if clean else (
-        "does not parse" if not parses else f"incomplete: {hard} stub markers")
+        "does not parse" if not parses else
+        f"unsanctioned dependency: {', '.join(unsanctioned)}" if unsanctioned else
+        f"incomplete: {hard} stub markers")
     return {"produced": True, "parses": parses, "parse_detail": pdetail,
-            "stub_hits": hard, "soft_flags": soft, "clean": clean, "reason": reason,
-            "deliverable_file": dfile}
+            "stub_hits": hard, "soft_flags": soft, "unsanctioned": unsanctioned,
+            "clean": clean, "reason": reason, "deliverable_file": dfile}

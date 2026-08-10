@@ -29,8 +29,19 @@ def entrypoint_module(skeleton: dict) -> str:
     return ep.replace("/", ".")
 
 
+def _stack_policy(handover: dict | None) -> dict:
+    """The Architect's proportionality decision (persistence + sanctioned dependency allow-list),
+    carried in the handover as `stack_policy`. Empty when absent (older handover) — then the build
+    keeps its prior bottom-up behaviour."""
+    return (handover or {}).get("stack_policy") or {}
+
+
 def agents_md(skeleton: dict, handover: dict | None = None) -> str:
     sk = skeleton or {}
+    policy = _stack_policy(handover)
+    sanctioned = [d for d in (policy.get("sanctioned_dependencies") or []) if isinstance(d, str)]
+    persistence = policy.get("recommended_persistence") or ""
+    orm_ok = bool(policy.get("relational_orm_required"))
     out = [
         "# Build contracts",
         f"Stack: {sk.get('stack', sk.get('language', 'unspecified'))}. "
@@ -43,6 +54,34 @@ def agents_md(skeleton: dict, handover: dict | None = None) -> str:
         out.append(f"- {item}")
     if sk.get("conventions"):
         out += ["", f"Conventions: {sk['conventions']}"]
+
+    # PERSISTENCE POLICY (from the Architect's proportionality review) — the simplest persistence
+    # the requirements justify. This is what stops an unrequested ORM being invented (and with it
+    # the whole class of column-type/session/relationship footguns).
+    if persistence:
+        out += ["", "## Persistence — use EXACTLY this, nothing heavier",
+                f"- Persistence approach: {persistence}."]
+        if not orm_ok:
+            out += [
+                "- Use Python's standard-library `sqlite3` DIRECTLY with SQL (CREATE TABLE, "
+                "parameterized INSERT/SELECT/UPDATE). Do NOT use an ORM — no SQLAlchemy, SQLModel, "
+                "Django ORM, or `declarative_base`. Open the database from a settings path "
+                "(`sqlite3.connect(settings.DATABASE_PATH)`).",
+                "- For identifiers use a TEXT column holding `uuid.uuid4().hex` (stdlib) or an "
+                "INTEGER PRIMARY KEY — NEVER a library-specific UUID column type.",
+                "- Keep data-access in one module (e.g. a small repository/db helper); routers and "
+                "services call it — they do not open connections themselves.",
+            ]
+
+    # ALLOWED DEPENDENCIES — the top-down allow-list. Importing anything else is REJECTED by the
+    # build's conformance check, so the file would have to be regenerated. Keep to this list.
+    if sanctioned:
+        out += ["", "## Allowed dependencies — the ONLY third-party packages you may import",
+                f"- {', '.join(sanctioned)}.",
+                "- Import NOTHING else third-party. If a task seems to need another package, use "
+                "the Python standard library instead (e.g. `sqlite3`, `json`, `uuid`, `datetime`, "
+                "`http.client`). Any unsanctioned import will be REJECTED and the file rebuilt."]
+
     out += [
         "",
         "## Contracts — MUST follow so the files form ONE runnable app",
@@ -50,18 +89,18 @@ def agents_md(skeleton: dict, handover: dict | None = None) -> str:
         "- REUSE what already exists. Never redefine a shared base/type/config/model that another "
         "file already defines — import it from its canonical module.",
         "- Export new public symbols from their package `__init__` so other modules can import them.",
-        "- Keep every dependency you import listed in the manifest.",
+        "- Import ONLY packages in the allowed-dependencies list above; keep them in the manifest.",
         "- Use types and APIs appropriate to the stack, so the app actually runs.",
         "- Use each library's CURRENT major-version conventions — do NOT use imports removed in the "
         "installed version (e.g. with Pydantic v2, import `BaseSettings` from `pydantic_settings` and "
         "add `pydantic-settings` to the manifest; never `from pydantic import BaseSettings`).",
         "- Declare EVERY configuration value the app reads in ONE settings/config module (database "
-        "URL, secrets, and the LLM settings below), each overridable from the environment with a "
+        "path, secrets, and the LLM settings below), each overridable from the environment with a "
         "sane default. If a module reads `settings.X`, `X` MUST be declared in that settings class.",
-        "- AVOID CIRCULAR IMPORTS: sibling modules (e.g. two model files) must not import each "
-        "other's classes at module load. Use string references for ORM relationships "
-        "(relationship('Item')), put cross-module type-only imports under `if TYPE_CHECKING:`, and "
-        "import shared pieces from a single base module — never sideways between siblings.",
+        "- AVOID CIRCULAR IMPORTS: sibling modules must not import each other's classes at module "
+        "load. Put cross-module type-only imports under `if TYPE_CHECKING:`, and import shared "
+        "pieces from a single base module — never sideways between siblings."
+        + (" Use string references for ORM relationships (relationship('Item'))." if orm_ok else ""),
         "- Write complete, working code. No placeholders, TODOs, mocks, or simulated logic.",
         "",
         "## Platform capability — a local LLM is available; use it, never fake an AI service",
