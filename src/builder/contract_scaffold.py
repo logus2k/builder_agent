@@ -260,8 +260,15 @@ def scaffold_persistence(workspace: str, log=print) -> str:
     return rel
 
 
-def scaffold(workspace: str, contract: dict, log=print) -> dict:
-    """Write a skeleton module for every contract concept. Returns what was written."""
+def scaffold(workspace: str, contract: dict, log=print, bodies: str = "working") -> dict:
+    """Write a skeleton module for every contract concept. Returns what was written.
+
+    `bodies` controls how function bodies are seeded:
+      - "working"     — a repo()-delegating CRUD body (green by construction). Used as the finalize
+                        FALLBACK to backfill any operation the model left unimplemented.
+      - "placeholder" — `raise NotImplementedError(...)`, so the model SEES the operation needs real
+                        logic and fills it (a working stub reads as 'already done' and gets skipped).
+                        Used for the INITIAL scaffold the model builds on."""
     paths = module_paths(contract)
     written = []
     # ensure package __init__.py files exist along the way
@@ -280,15 +287,21 @@ def scaffold(workspace: str, contract: dict, log=print) -> dict:
     for key, v in contract.items():
         rel = paths[key]
         header = [f'"""{v.get("concept", key)} ({v.get("kind")}) — generated from the code contract."""']
-        # dependency imports: import each dependency's exported symbols by their exact contract names
+        # dependency imports: each dependency's exported symbols by their exact contract names. These are
+        # referenced only in type positions (field-type comments / annotations, or heal-filled hints), NEVER
+        # in executable scaffold code, and concepts routinely reference each other (tenant <-> tenant_config),
+        # so importing them eagerly at module load forms circular-import chains that crash the boot the moment
+        # a model module is imported at runtime (e.g. a router that mounts an entity-hosted operation). Guard
+        # them under TYPE_CHECKING: available to type-checkers and as heal context, inert at runtime.
         imports = []
+        type_imports = []
         for dep in v.get("depends_on", []):
             dv = contract.get(dep)
             if not dv or dep == key:
                 continue
             syms = [e["symbol"] for e in dv.get("exports", []) if e.get("symbol")]
             if syms:
-                imports.append(f"from {_module_dotted(paths[dep])} import {', '.join(sorted(set(syms)))}")
+                type_imports.append(f"    from {_module_dotted(paths[dep])} import {', '.join(sorted(set(syms)))}")
         # exports: a filled body per contract export — CRUD operations delegate to the real repository
         # (working by construction); classes keep their fields; non-CRUD ops stay stubs for the model.
         body_lines, needs_repo = [], False
@@ -307,18 +320,27 @@ def scaffold(workspace: str, contract: dict, log=print) -> dict:
                 body_lines.append("")
             elif e.get("kind") == "function":
                 params = [p["name"] for p in e.get("inputs", []) if p.get("name")]
-                verb = _verb(sym)
-                crud = _crud_body(verb, params, _repo_name(sym, e.get("returns"), key))
                 body_lines.append(f"def {sym}({', '.join(params)}):")
-                if crud:
-                    body_lines.append(f"    {crud}")
-                    needs_repo = True
+                if bodies == "placeholder":
+                    # An explicit not-yet-implemented body: the model recognizes it must supply the real
+                    # logic (a working stub reads as done and is skipped). finalize backfills any left.
+                    body_lines.append(
+                        f'    raise NotImplementedError("{sym}: implement per the assigned task(s)")')
+                    needs_repo = True                    # keep the seam imported and ready to use
                 else:
-                    body_lines.append(f"    ...  # custom operation (no CRUD mapping) -> {e.get('returns')}")
+                    verb = _verb(sym)
+                    crud = _crud_body(verb, params, _repo_name(sym, e.get("returns"), key))
+                    if crud:
+                        body_lines.append(f"    {crud}")
+                        needs_repo = True
+                    else:
+                        body_lines.append(f"    ...  # custom operation (no CRUD mapping) -> {e.get('returns')}")
                 body_lines.append("")
         if needs_repo:
             imports.append("from app.repositories.store import repo")
-        lines = header + sorted(imports) + [""] + body_lines
+        type_block = (["from typing import TYPE_CHECKING", "", "if TYPE_CHECKING:"]
+                      + sorted(type_imports)) if type_imports else []
+        lines = header + sorted(imports) + type_block + [""] + body_lines
         content = "\n".join(lines) + "\n"
         abspath = os.path.join(workspace, rel)
         os.makedirs(os.path.dirname(abspath), exist_ok=True)
@@ -337,23 +359,29 @@ def scaffold_api(workspace: str, contract: dict, log=print) -> dict:
     that imports every router and mounts it. Routers therefore stop inventing imports (the cause of
     the residual `missing_module` drift), and every service is reachable (routes wired by
     construction). FastAPI-specific — the one stack-aware step, kept small."""
-    services = {k: v for k, v in contract.items() if v.get("kind") == "service"}
+    # Routability follows CONTENT, not the concept's `kind` label: any concept that exports at least
+    # one FUNCTION owns operations and gets a router; the operations are exactly its function exports
+    # (class exports are data models, never routed). The Architect sometimes co-locates operations on
+    # an entity (e.g. `reservation` owns `submit_reservation`), so gating on kind=="service" silently
+    # drops those endpoints. `kind` still drives file placement (module_paths), only not routing.
+    def _ops(v):
+        return [e for e in v.get("exports", []) if e.get("kind") == "function" and e.get("symbol")]
+    routable = {k: v for k, v in contract.items() if _ops(v)}
     paths = module_paths(contract)
     os.makedirs(os.path.join(workspace, "app/api"), exist_ok=True)
     open(os.path.join(workspace, "app/api/__init__.py"), "a", encoding="utf-8").close()
     routers = []
-    for key, v in services.items():
+    for key, v in routable.items():
         rel = f"app/api/{key}.py"
-        syms = [e["symbol"] for e in v.get("exports", []) if e.get("symbol")]
+        ops = _ops(v)
+        syms = [e["symbol"] for e in ops]
         lines = [f'"""{v.get("concept", key)} API router — generated from the code contract."""',
                  "from fastapi import APIRouter"]
         if syms:
             lines.append(f"from {_module_dotted(paths[key])} import {', '.join(sorted(set(syms)))}")
         lines += ["", f'router = APIRouter(prefix="/{key}", tags=["{key}"])', ""]
-        for e in v.get("exports", []):
-            op = e.get("symbol")
-            if not op:
-                continue
+        for e in ops:
+            op = e["symbol"]
             params = ", ".join(p["name"] for p in e.get("inputs", []) if p.get("name"))
             lines.append(f'@router.post("/{op}")')
             lines.append(f"def {op}_endpoint({params}):")

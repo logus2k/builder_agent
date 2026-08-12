@@ -8,12 +8,82 @@ No Claude, offline-capable — the whole build loop is local.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
+import tempfile
 import time
+import urllib.request
 
 OPENCODE = os.path.expanduser("~/.opencode/bin/opencode")
-MODEL = os.environ.get("BUILDER_MODEL", "local-llama/gemma-4")
+#: The llama.cpp server opencode talks to (same host as the opencode provider baseURL).
+MODEL_URL = os.environ.get("BUILDER_LLM_URL", "http://127.0.0.1:8500").rstrip("/")
+
+
+def _resolve_model() -> str:
+    """Use whatever CHAT model is ACTIVE on the server — never pin a specific id (a hardcoded name
+    just relocates the 'model not found' failure the next time the loaded model changes). BUILDER_LLM_MODEL
+    overrides; otherwise pick the primary chat model from /v1/models: exclude embedders/rerankers, then
+    take the largest loaded model (the main chat model is invariably larger than any draft/embedder).
+    Swapping the loaded model on the server changes the model here with no code change."""
+    override = os.environ.get("BUILDER_LLM_MODEL")
+    if override:
+        return override
+    try:
+        data = json.load(urllib.request.urlopen(f"{MODEL_URL}/v1/models", timeout=5)).get("data", [])
+        cands = []
+        for m in data:
+            mid = m.get("id", "")
+            low = mid.lower()
+            if any(x in low for x in ("bge", "embed", "rerank")):
+                continue
+            args = " ".join((m.get("status") or {}).get("args") or [])
+            if "--embeddings" in args:                    # an embedding backend, not a chat model
+                continue
+            loaded = ((m.get("status") or {}).get("value") == "loaded")
+            nparams = ((m.get("meta") or {}).get("n_params")) or 0
+            cands.append((loaded, nparams, mid))
+        if cands:
+            cands.sort(key=lambda t: (t[0], t[1]), reverse=True)   # prefer loaded, then largest
+            return cands[0][2]
+    except Exception:
+        pass
+    return "gemma-4-12b"
+
+
+#: Cached generated-config path (per build session); refreshed when a session starts (first=True).
+_CFG_PATH: str | None = None
+
+
+def _opencode_config_path(refresh: bool = False) -> str:
+    """Write a self-contained opencode config PINNED TO THE ACTIVE MODEL and return its path, so the
+    build uses whatever model is loaded — independent of any static/mounted config. Set via
+    OPENCODE_CONFIG on the subprocess env. Cached across a session; refreshed when a session starts."""
+    global _CFG_PATH
+    if _CFG_PATH and not refresh:
+        return _CFG_PATH
+    model = _resolve_model()
+    cfg = {
+        "$schema": "https://opencode.ai/config.json",
+        # LSP OFF: pyright analysis costs ~50s/task (GPU idle) while our correctness comes from
+        # run-verify + guarded repair, not the editor. Off => the build is inference-bound, not
+        # blocked on a language server (which also isn't installed for every stack anyway).
+        "lsp": False,
+        "provider": {"local-llama": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Local llama.cpp Server",
+            "options": {"baseURL": f"{MODEL_URL}/v1", "apiKey": "not-needed"},
+            "models": {model: {"name": model, "reasoning": True, "tool_call": True,
+                               "temperature": True, "limit": {"context": 32768, "output": 8192}}},
+        }},
+        "model": f"local-llama/{model}",
+        "agent": {"build": {"temperature": 0}},
+    }
+    path = os.path.join(tempfile.gettempdir(), "builder_opencode.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    _CFG_PATH = path
+    return path
 
 
 def list_files(workdir: str, since: set | None = None) -> list[str]:
@@ -84,19 +154,23 @@ AGENT = os.environ.get("BUILDER_AGENT_NAME", "builder")
 
 
 def run_opencode(instr: str, workdir: str, first: bool = False, attach: str | None = None,
-                 timeout: float = 420) -> tuple[list[str], dict]:
+                 timeout: float = 420, agent: str | None = None) -> tuple[list[str], dict]:
     """Run one opencode step in the project's CONTINUED session (so it accumulates context of what
     it already built) as the custom `builder` agent. `first` starts the session; later steps use
     --continue. Returns (changed_files, diag): files created/modified, plus a diagnosis dict
     (exit code, timeout flag, duration, stderr/stdout tails) so a 'no output' is never a black box."""
     os.makedirs(workdir, exist_ok=True)
     before = _snapshot(workdir)
-    cmd = [OPENCODE, "run", instr, "--auto", "--agent", AGENT, "--dir", workdir]
+    cmd = [OPENCODE, "run", instr, "--auto", "--agent", agent or AGENT, "--dir", workdir]
     if not first:
         cmd.append("--continue")           # continue THIS project's session (shared context)
     if attach:
         cmd += ["--attach", attach]
-    env = {**os.environ, "PATH": os.path.dirname(OPENCODE) + ":" + os.environ.get("PATH", "")}
+    # OPENCODE_CONFIG points opencode at a generated config pinned to the ACTIVE model (model-agnostic):
+    # refresh it when a session starts (first) so a mid-session model swap is not required, and reuse the
+    # cached one for the continued steps.
+    env = {**os.environ, "PATH": os.path.dirname(OPENCODE) + ":" + os.environ.get("PATH", ""),
+           "OPENCODE_CONFIG": _opencode_config_path(refresh=first)}
     diag = {"exit": None, "timeout": False, "dur": 0.0, "stderr": "", "stdout": ""}
     t0 = time.time()
     try:
@@ -148,26 +222,57 @@ def _file_instruction(path: str, tasks: list[dict], skeleton: dict | None, exist
                       for t in tasks)
     no_mock = ("If any task mentions mocking or stubbing an external service, implement a real, "
                "configurable client/adapter instead. Write complete, working code — no placeholders, "
-               "TODOs, mocks, or simulated logic.")
+               "TODOs, mocks, or simulated logic. This is a BACKEND Python module: write ONLY server-"
+               "side Python. If a task describes a frontend/UI artifact (a React/Vue/SPA component, a "
+               "map widget, HTML/CSS/JS, or a browser API client), implement ONLY its backend counterpart"
+               " — the endpoint/service/data the UI needs — and put NO HTML, CSS, JS, JSX or TypeScript "
+               "in this file (the UI is generated separately). For data access use the in-memory "
+               "repository `repo(name)` from app.repositories.store; do NOT introduce SQLAlchemy or any "
+               "ORM. Preserve the module's existing imports and public names exactly.")
     if exists:
-        return (f"The file '{path}' ALREADY EXISTS — it is a design-contract scaffold carrying the "
-                f"EXACT imports and the class/function signatures the rest of the app depends on. "
-                f"IMPLEMENT the bodies so it also satisfies:\n{specs}\n{frame} CRITICAL: preserve "
-                f"EVERY class name, function name, parameter list, and import EXACTLY as written — do "
-                f"not rename, re-signature, remove, or reorder them; other modules import them by "
-                f"these exact names. Replace only the placeholder bodies (`...` and `= None`) and add "
-                f"any needed internal helpers. {no_mock}")
+        return (f"IMPLEMENT the stub functions in the single file '{path}'. Each body is currently "
+                f"`raise NotImplementedError(...)`; use the `edit` tool to REPLACE every one with the real "
+                f"implementation the tasks below require (validation, the repo() queries/filtering/nesting, "
+                f"orchestration, error handling). Work ONLY inside this file.\n{specs}\n{frame}\n"
+                f"EFFICIENCY (important — keep the context small): do NOT `read` whole dependency files. To "
+                f"check a symbol, signature or field, use `grep`/`glob` for that specific name only. You "
+                f"already know the data seam: `repo(name).create(dict)/get(id)/list()/update(id,dict)/"
+                f"delete(id)` from app.repositories.store.\nCRITICAL: keep every existing function/class "
+                f"NAME, parameter list and import EXACTLY as written (other modules import them by these "
+                f"names); rewrite only the BODIES and add internal helpers as needed. Implement a task's "
+                f"operation inside the existing function it maps to — never add a divergently-named "
+                f"duplicate. {no_mock}")
     return (f"Create the file at path '{path}' (create any directories it needs) as ONE coherent, "
             f"complete module that implements ALL of the following together — shared imports, one "
             f"consistent set of names, no duplicated definitions:\n{specs}\n{frame} {no_mock}")
+
+
+def _stub_instruction(path: str, tasks: list[dict]) -> str:
+    """A SHORT stub-completion prompt for the focused `stubs` subagent. No full task dump — the
+    signatures are self-describing and a long spec is what blows the context; pass only the task
+    TITLES as a hint of intent. MEASURED: this + the stubs subagent fills a service in ~25s with one
+    read, versus the primary agent reading ~33 files, compacting, and never editing."""
+    titles = "; ".join(t.get("title", "") for t in tasks if t.get("title"))[:600]
+    return (f"Implement every stub (a `raise NotImplementedError` body) in the file: {path}. "
+            f"Replace each with real, working logic using `repo(name)` "
+            f"(create(dict)/get(id)/list()/update(id, dict)/delete(id)) from app.repositories.store — "
+            f"store FULL field dicts, filter/nest via `.list()`. Use `grep`/`glob` to check a specific "
+            f"name; do NOT read whole files. Apply with `edit`, keep the existing names/params/imports. "
+            + (f"What these functions are for: {titles}." if titles else ""))
 
 
 def build_file(path: str, tasks: list[dict], workdir: str, skeleton: dict | None = None,
                first: bool = False, attach: str | None = None,
                timeout: float = 600) -> tuple[list[str], str]:
     """Generate the whole file `path` in one opencode pass from all `tasks` assigned to it. If the
-    file already exists (a contract scaffold), FILL its bodies while preserving its interface."""
+    file already exists as a contract scaffold, implement its stub bodies with the focused `stubs`
+    SUBAGENT (a short prompt, its own fresh context) — never the primary agent + a huge merged spec,
+    which reads the whole tree, compacts, and edits nothing. New files use the primary builder agent."""
     exists = os.path.isfile(os.path.join(workdir, path)) and os.path.getsize(os.path.join(workdir, path)) > 0
+    if exists:
+        # Fresh context per file (no --continue) keeps the stub agent's window small and reliable.
+        return run_opencode(_stub_instruction(path, tasks), workdir, first=True,
+                            attach=attach, timeout=timeout, agent="stubs")
     return run_opencode(_file_instruction(path, tasks, skeleton, exists=exists), workdir,
                         first=first, attach=attach, timeout=timeout)
 

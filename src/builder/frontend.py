@@ -64,9 +64,13 @@ def _endpoints_from_contract(contract: dict) -> list[dict]:
     deterministically from the contract (same mapping the router scaffold uses)."""
     eps = []
     for key, v in contract.items():
-        if v.get("kind") != "service":
-            continue
+        # Route by CONTENT, not by the concept's `kind` label: any export that is a FUNCTION is an
+        # operation and gets an endpoint; a `class` export is a data model and does not. The Architect
+        # sometimes co-locates operations on an entity (e.g. `reservation` owns `submit_reservation`),
+        # so gating on kind=="service" silently drops those ops. Mirrors scaffold_api's routing rule.
         for e in v.get("exports", []):
+            if e.get("kind") != "function":
+                continue
             op = e.get("symbol")
             if not op:
                 continue
@@ -82,14 +86,19 @@ def _match(text: str, keywords) -> bool:
 
 
 def _call_model(prompt: str, log) -> str:
-    # Use the model's FULL 32K window. MEASURED root cause of the earlier failures: my 16K cap cut off
-    # the <think> phase mid-stream (think alone was ~15K tokens -> hit the cap -> ZERO HTML emitted).
-    # With the full 32K, thinking finishes (~15-16K) AND the document fits after it (~3-4K), so the
-    # model both thinks and writes the complete page. Thinking stays ON. The <think>...</think> prefix
-    # is stripped below by extracting only the <!doctype ...</html> document.
+    # Thinking ON at temperature 0.7, 64K budget. MEASURED (all 5 pages, both modes, same prompt):
+    #   - temp 0.2 + thinking ON  -> a low-entropy repetition loop ("Wait, the prompt says: ...") that
+    #     never closes </think>, hits the 64K cap (finish_reason=length) and emits ZERO html. The 0.2
+    #     near-greedy decoder gets trapped in that basin; it is NOT a parsing bug nor the model's size.
+    #   - temp 0.7 + thinking ON  -> reasoning completes and closes; all 5 pages finish_reason=stop with
+    #     complete, correctly-wired html in ~20-48s and a real 5-18K-char reasoning trace.
+    # The server returns the reasoning in a separate `reasoning_content` field, so `content` is already
+    # clean html when </think> closes; the </think> strip below is belt-and-suspenders for the rare case
+    # the block is inlined. Keep temp >= 0.5 with thinking on — 0.2 reintroduces the loop.
     body = json.dumps({"model": _resolve_model(), "messages": [{"role": "user", "content": prompt}],
-                       "temperature": float(os.environ.get("FRONTEND_TEMP", "0.2")),
-                       "max_tokens": int(os.environ.get("FRONTEND_MAX_TOKENS", "64000"))}).encode()
+                       "temperature": float(os.environ.get("FRONTEND_TEMP", "0.7")),
+                       "max_tokens": int(os.environ.get("FRONTEND_MAX_TOKENS", "64000")),
+                       "chat_template_kwargs": {"enable_thinking": True}}).encode()
     req = urllib.request.Request(f"{MODEL_URL}/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
     out = json.load(urllib.request.urlopen(req, timeout=240))

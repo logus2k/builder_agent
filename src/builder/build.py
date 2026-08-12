@@ -71,6 +71,35 @@ def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=p
     paths = contract_scaffold.module_paths(contract)
     keep = set(paths.values()) | {f"app/api/{k}.py" for k, v in contract.items()
                                   if v.get("kind") == "service"} | {"main.py", persist}
+
+    # RESPECT PLANNER TASKS: don't blanket-prune every non-contract file — a plan task that produced a
+    # real module wired INTO the app (imported, transitively, from a kept file) should survive. Walk
+    # imports from the kept set and keep every internal .py it reaches that parses. Broken/orphaned
+    # drift is still pruned below (and a final pass drops anything that remains unresolved).
+    def _internal_imports(abspath):
+        try:
+            tree = ast.parse(open(abspath, encoding="utf-8").read())
+        except (SyntaxError, OSError, ValueError):
+            return set()
+        mods = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                mods |= {a.name for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.module and n.level == 0:
+                mods.add(n.module)
+        return mods
+
+    frontier, reach = list(keep), set(keep)
+    while frontier:
+        ap = os.path.join(workspace, frontier.pop())
+        if not os.path.isfile(ap):
+            continue
+        for mod in _internal_imports(ap):
+            cand = mod.replace(".", "/") + ".py"
+            if cand not in reach and os.path.isfile(os.path.join(workspace, cand)):
+                reach.add(cand); frontier.append(cand)
+    keep = reach
+
     pruned = 0
     for root, dirs, files in os.walk(workspace, topdown=False):          # (2) prune drift
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
@@ -115,13 +144,20 @@ def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=p
             return True
         if "sqlalchemy" in src or "declarative_base" in src:
             return True
+        # An operation the model left as the not-yet-implemented placeholder — backfill it with the
+        # working repo() stub so the endpoint returns real data instead of raising at runtime.
+        if "raise NotImplementedError" in src:
+            return True
         return any(e.get("symbol") and e["symbol"] not in have for e in v.get("exports", []))
 
     rescaffolded = 0
-    # Regenerate ALL service bodies deterministically (working CRUD delegating to the repository, or a
-    # stub for a genuinely custom op) — model service bodies are the unreliable part and this makes the
-    # endpoints actually WORK. Entities keep their model-filled bodies unless the model broke them.
-    bad = {k for k, v in contract.items() if v.get("kind") == "service" or _shape_bad(k, v)}
+    # Re-scaffold a service ONLY when the model left it BROKEN (unparseable, missing a contract export,
+    # ORM-tainted) or with unresolved imports (added to `bad` by heal.detect in the loop below) — NOT
+    # unconditionally. Blanket-regenerating every service discards the model's real business logic and
+    # leaves endpoints as generic repo-CRUD stubs; keeping a VALID model body gives real behaviour while
+    # the deterministic stub still stands in for any body that would not import/parse (green-guarantee
+    # as a FALLBACK, not an override). Routers/main are re-asserted separately (pure wiring).
+    bad = {k for k, v in contract.items() if _shape_bad(k, v)}
     for _ in range(6):                      # bounded fixpoint
         # add contract modules the detector flags (unresolved imports / missing exports)
         for issue in heal.detect(workspace, py_exe=None, skeleton=skeleton, sanctioned=None):
@@ -320,6 +356,40 @@ def _concept_vocab(handover: dict) -> list[str]:
     return sorted(v for v in vocab if v)
 
 
+def _place_on_contract(task: dict, contract: dict, module_paths: dict) -> str | None:
+    """Route a task onto the Architect's CONTRACT SCAFFOLD module it implements — the file the app
+    actually wires and finalize KEEPS — instead of letting the placer invent a parallel path that
+    finalize then prunes (the root cause of 'opencode built 41 files, app got 0 real logic').
+
+    A task's `traces_to` req_ids identify its aspect's concepts (req_ids are attached aspect-granular,
+    so every concept of the aspect carries them). A behavioural task (code/config) fills the aspect's
+    OPERATION-bearing concept — the one exporting functions, i.e. its service (or an entity that owns
+    operations, like `reservation`). A schema/data task fills the matching entity. Deterministic — no
+    model call; returns None when nothing maps (caller falls back to the agentic placer)."""
+    traces = set(task.get("traces_to") or [])
+    if not traces or not contract:
+        return None
+
+    def _ov(k: str) -> int:
+        return len(traces & set(contract[k].get("req_ids") or []))
+
+    cands = [k for k in contract if _ov(k) > 0]
+    if not cands:
+        return None
+    ops = [k for k in cands if any(e.get("kind") == "function" for e in contract[k].get("exports", []))]
+    entities = [k for k in cands if k not in ops]
+    kind = (task.get("kind") or "").lower()
+    target = None
+    if kind == "schema" and entities:
+        text = ((task.get("deliverable") or "") + " " + (task.get("title") or "")).lower().replace("_", "")
+        target = next((k for k in entities if k.replace("_", "") in text), None) or max(entities, key=_ov)
+    elif ops:
+        target = max(ops, key=_ov)              # the aspect's service (business logic lives here)
+    elif entities:
+        target = max(entities, key=_ov)
+    return module_paths.get(target) if target else None
+
+
 def _order_files(paths: list[str], skeleton: dict) -> list[str]:
     entry = (skeleton or {}).get("entrypoint")
 
@@ -454,7 +524,9 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     contract = (handover or {}).get("code_contract") or {}
     if contract:
         contract_scaffold.scaffold_persistence(workspace, log=log)          # real data-access seam
-        scaf = contract_scaffold.scaffold(workspace, contract, log=log)
+        # PLACEHOLDER bodies so opencode SEES each operation needs real logic and implements it (a
+        # working stub reads as 'already done' and gets skipped). finalize backfills any it leaves.
+        scaf = contract_scaffold.scaffold(workspace, contract, log=log, bodies="placeholder")
         api = contract_scaffold.scaffold_api(workspace, contract, log=log)   # routers + entrypoint
         _seed_contract_modules(cmap, contract, log)
         log(f"contract: scaffolded {scaf['modules']} modules + {api['routers']} routers + main "
@@ -472,13 +544,23 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     # calls, no opencode. Result: a file -> [tasks] grouping. A canonical concept vocabulary (from
     # the architecture) keeps concept keys stable so same-concept tasks collapse into one file.
     concept_vocab = _concept_vocab(handover)
+    mpaths = contract_scaffold.module_paths(contract) if contract else {}
     groups: dict[str, list[dict]] = {}
+    on_contract = 0
     for t in order:
-        p = structure.place_task(t, cmap, design_hint=_design_hint(t, handover, req_aspect),
-                                 concept_vocab=concept_vocab)
-        groups.setdefault(p["path"], []).append(t)
+        # Route onto the Architect's contract scaffold first (the files the app wires and finalize
+        # keeps). Only tasks that map to no concept fall back to the agentic placer — so opencode
+        # FILLS the real modules instead of inventing a parallel tree that gets pruned.
+        cp = _place_on_contract(t, contract, mpaths)
+        if cp:
+            groups.setdefault(cp, []).append(t)
+            on_contract += 1
+        else:
+            p = structure.place_task(t, cmap, design_hint=_design_hint(t, handover, req_aspect),
+                                     concept_vocab=concept_vocab)
+            groups.setdefault(p["path"], []).append(t)
     groups = _normalize_collisions(groups, log)      # one canonical location per concept (no module/package collision)
-    log(f"placed {len(order)} tasks into {len(groups)} files")
+    log(f"placed {len(order)} tasks into {len(groups)} files ({on_contract} onto the contract scaffold)")
 
     # PHASE 2 — GENERATION: write each file ONCE from ALL its tasks' merged specs (one opencode
     # pass per file — not N incremental extends, which corrupt large files). Base layer first.
@@ -590,6 +672,20 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     failed = sum(1 for r in results if r["outcome"] == "failed")
     noout = sum(1 for r in results if r["outcome"] == "no_output")
     judged = built + failed
+    # RESPECT THE PLANNER: account for EVERY plan task — none silently dropped. `results` carries one
+    # entry per task; here we assert coverage (every plan task_id appears) and list any unfulfilled.
+    plan_task_ids = {t.get("task_id") for t in plan.get("tasks", []) if t.get("task_id")}
+    result_task_ids = {r.get("task_id") for r in results if r.get("task_id")}
+    unfulfilled = sorted(r.get("task_id") for r in results if r["outcome"] != "built" and r.get("task_id"))
+    missing_from_results = sorted(plan_task_ids - result_task_ids)      # tasks never even placed/attempted
+    task_fulfillment = {
+        "plan_tasks": len(plan_task_ids),
+        "attempted": len(result_task_ids),
+        "fulfilled": built,
+        "unfulfilled": unfulfilled[:50],
+        "not_attempted": missing_from_results[:50],
+        "all_accounted_for": not missing_from_results,
+    }
     report = {
         "workspace": workspace,
         "skeleton": skeleton,
@@ -599,7 +695,7 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
                     "build_success_rate": round(built / judged, 3) if judged else None,
                     "files": len(_list_code_files(workspace)),
                     "runnable": run.get("runnable"), "finalize": finalize,
-                    "frontend": frontend_report},
+                    "frontend": frontend_report, "task_fulfillment": task_fulfillment},
         "assembly": {"manifest": manifest, "entrypoint": entry, "foundations": foundations,
                      "run_verify": run},
         "results": results,

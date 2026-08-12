@@ -59,8 +59,27 @@ class Job:
                 "elapsed_s": round(time.time() - self.started_at) if self.started_at else None}
 
 
+_FACTORY_RELAY = os.environ.get("FACTORY_RELAY_URL", "http://localhost:7803").rstrip("/")
+
+
+def _factory_emit(pid: str, stage: str, status: str = "progress",
+                  message: str | None = None, progress: dict | None = None) -> None:
+    """Best-effort: push a stage event to the FACTORY socket.io hub (the Analyst relay) so the pipeline
+    Overview's DEVELOPMENT lane updates LIVE instead of by polling. Never breaks a run on telemetry."""
+    import json as _json
+    import urllib.request as _u
+    try:
+        data = _json.dumps({"lane": "development", "stage": stage, "status": status,
+                            "message": message, "progress": progress}).encode()
+        _u.urlopen(_u.Request(f"{_FACTORY_RELAY}/relay/{pid}", data=data,
+                              headers={"Content-Type": "application/json"}, method="POST"), timeout=2)
+    except Exception:
+        pass
+
+
 class JobManager:
-    """Owns builder jobs; runs each in a worker thread. Polling-only (no socket.io)."""
+    """Owns builder jobs; runs each in a worker thread. Live lane updates over socket.io via the
+    Analyst relay (see _factory_emit); the job snapshot is also kept for replay/robustness."""
 
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
@@ -68,6 +87,7 @@ class JobManager:
     def _run_builder(self, job: Job, cap: int | None, retries: int) -> None:
         job.status = "running"
         job.started_at = time.time()
+        _factory_emit(job.project_id, "backend", "running", "Build started")
         try:
             job.stage = "fetch"
             job.progress = {"stage": "fetch", "status": "progress"}
@@ -83,25 +103,53 @@ class JobManager:
             # The build log drives the progress bar. Two-phase build: it logs
             # "placed N tasks into M files" (M = total to generate), then one "[outcome] path (…)"
             # line per FILE as it is generated.
-            counter = {"done": 0, "total": 0}
+            # Two DISTINCT development stages surfaced to the FACTORY Overview: BACKEND (build the
+            # API from the plan) then FRONTEND (generate the UI). The Overview's Development lane reads
+            # job.stage + job.progress, so each shows as its own activity with its own done/total.
+            counter = {"done": 0, "total": 0, "phase": "backend",
+                       "fe_done": 0, "fe_total": 0}
 
             def _log(msg: str = "") -> None:
                 st = str(msg).strip()
-                if st.startswith("placed ") and "into" in st and "file" in st:
+                if st.startswith("frontend:") and "derived" in st and "page" in st:
+                    # "frontend: derived N page(s) from aspects: [...]"
+                    parts = st.split()
+                    n = parts[parts.index("derived") + 1] if "derived" in parts else "0"
+                    counter["phase"] = "frontend"
+                    counter["fe_total"] = int(n) if n.isdigit() else 0
+                    job.stage = "frontend"
+                    job.progress = {"stage": "frontend", "status": "progress",
+                                    "done": 0, "total": counter["fe_total"]}
+                elif st.startswith("frontend stage:"):
+                    counter["phase"] = "frontend"
+                    job.stage = "frontend"
+                    job.progress = {"stage": "frontend", "status": "progress",
+                                    "done": counter["fe_done"], "total": counter["fe_total"], "last": st[:120]}
+                elif st.startswith("[frontend]") and ".html" in st:
+                    counter["fe_done"] += 1
+                    job.progress = {"stage": "frontend", "status": "progress",
+                                    "done": counter["fe_done"], "total": counter["fe_total"], "last": st[:120]}
+                elif st.startswith("placed ") and "into" in st and "file" in st:
                     parts = st.split()
                     if "into" in parts:
                         n = parts[parts.index("into") + 1]
                         counter["total"] = int(n) if n.isdigit() else counter["total"]
-                    job.progress = {"stage": "build", "status": "progress",
+                    job.progress = {"stage": "backend", "status": "progress",
                                     "done": 0, "total": counter["total"]}
-                elif st.startswith("["):
+                elif st.startswith("[") and counter["phase"] == "backend":
                     counter["done"] += 1
-                    job.progress = {"stage": "build", "status": "progress",
+                    job.progress = {"stage": "backend", "status": "progress",
                                     "done": counter["done"], "total": counter["total"],
                                     "last": st[:120]}
+                # Push a live lane update only when the stage or the done-count actually changed
+                # (once per file + at stage boundaries) — not on every log line — to keep the relay light.
+                sig = (job.stage, (job.progress or {}).get("done"))
+                if sig != counter.get("_sig"):
+                    counter["_sig"] = sig
+                    _factory_emit(job.project_id, job.stage, "progress", st[:100], job.progress)
 
-            job.stage = "build"
-            job.progress = {"stage": "build", "status": "progress", "done": 0, "total": 0}
+            job.stage = "backend"
+            job.progress = {"stage": "backend", "status": "progress", "done": 0, "total": 0}
             report = build_mod.build_plan(plan, workspace, cap=cap, retries=retries, log=_log)
 
             job.stage = "publish"
@@ -114,9 +162,12 @@ class JobManager:
             job.status = "done"
             job.stage = "done"
             job.progress = {"stage": "done", "status": "done", **summary}
+            _factory_emit(job.project_id, "done", "done",
+                          f"{summary.get('built', 0)} built · runnable {summary.get('runnable', '?')}", summary)
         except Exception as e:  # noqa: BLE001 — surface any pipeline failure to the client
             job.status = "error"
             job.error = f"{type(e).__name__}: {e}"
+            _factory_emit(job.project_id, "error", "error", job.error)
 
     def create_builder_run(self, pid: str, actor: str | None = None,
                            cap: int | None = None, retries: int = 2) -> Job:
