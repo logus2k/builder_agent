@@ -135,28 +135,40 @@ def build_with_retry(task: dict, workdir: str, target_path: str, action: str = "
     return [], retries + 1
 
 
-def _file_instruction(path: str, tasks: list[dict], skeleton: dict | None) -> str:
+def _file_instruction(path: str, tasks: list[dict], skeleton: dict | None, exists: bool = False) -> str:
     """One instruction that writes an ENTIRE file from ALL the tasks assigned to it — so a file
     with many tasks is generated in ONE coherent pass, not N fragile incremental extends (which
-    corrupt large files). Same names, shared imports, no duplication across the tasks."""
+    corrupt large files). Same names, shared imports, no duplication across the tasks. When the file
+    already exists as a CONTRACT SCAFFOLD, the instruction becomes fill-the-bodies-preserving-the-
+    interface, so the imports/exports the rest of the app relies on are not altered."""
     sk = skeleton or {}
     frame = (f" This is part of a {sk.get('stack') or sk.get('language','')} project; follow its "
              f"conventions ({sk.get('conventions','')}).") if sk else ""
     specs = "\n".join(f"  - {t.get('title','')}: {(t.get('instructions','') or '').strip()}"
                       for t in tasks)
+    no_mock = ("If any task mentions mocking or stubbing an external service, implement a real, "
+               "configurable client/adapter instead. Write complete, working code — no placeholders, "
+               "TODOs, mocks, or simulated logic.")
+    if exists:
+        return (f"The file '{path}' ALREADY EXISTS — it is a design-contract scaffold carrying the "
+                f"EXACT imports and the class/function signatures the rest of the app depends on. "
+                f"IMPLEMENT the bodies so it also satisfies:\n{specs}\n{frame} CRITICAL: preserve "
+                f"EVERY class name, function name, parameter list, and import EXACTLY as written — do "
+                f"not rename, re-signature, remove, or reorder them; other modules import them by "
+                f"these exact names. Replace only the placeholder bodies (`...` and `= None`) and add "
+                f"any needed internal helpers. {no_mock}")
     return (f"Create the file at path '{path}' (create any directories it needs) as ONE coherent, "
             f"complete module that implements ALL of the following together — shared imports, one "
-            f"consistent set of names, no duplicated definitions:\n{specs}\n{frame} "
-            f"If any task mentions mocking or stubbing an external service, implement a real, "
-            f"configurable client/adapter instead. Write complete, working code — no placeholders, "
-            f"TODOs, mocks, or simulated logic.")
+            f"consistent set of names, no duplicated definitions:\n{specs}\n{frame} {no_mock}")
 
 
 def build_file(path: str, tasks: list[dict], workdir: str, skeleton: dict | None = None,
                first: bool = False, attach: str | None = None,
                timeout: float = 600) -> tuple[list[str], str]:
-    """Generate the whole file `path` in one opencode pass from all `tasks` assigned to it."""
-    return run_opencode(_file_instruction(path, tasks, skeleton), workdir,
+    """Generate the whole file `path` in one opencode pass from all `tasks` assigned to it. If the
+    file already exists (a contract scaffold), FILL its bodies while preserving its interface."""
+    exists = os.path.isfile(os.path.join(workdir, path)) and os.path.getsize(os.path.join(workdir, path)) > 0
+    return run_opencode(_file_instruction(path, tasks, skeleton, exists=exists), workdir,
                         first=first, attach=attach, timeout=timeout)
 
 

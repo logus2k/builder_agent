@@ -10,11 +10,13 @@ Prerequisites build before dependents (shared workspace) so a dependent can use 
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import urllib.request
 
-from . import assemble, context, heal, opencode, release, repair, structure, verify
+from . import (assemble, context, contract_scaffold, frontend, frontend_gate, heal, opencode, release,
+               repair, structure, verify)
 
 _SKIP_DIRS = {"__pycache__", ".venv_build", ".venv", ".git", ".opencode", "node_modules"}
 
@@ -48,6 +50,165 @@ def _normalize_collisions(groups: dict, log=print) -> dict:
         else:
             fixed.setdefault(path, []).extend(tasks)
     return fixed
+
+
+def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=print) -> dict:
+    """Guarantee the acceptance-green STRUCTURE regardless of what the model produced. The model
+    reliably degrades scaffolds (drops exports, un-mounts routers, injects an ORM, imports files it
+    never created); rather than chase that, we re-assert the deterministic contract structure as the
+    final step and drop the drift:
+
+      1. re-assert routers + entrypoint (pure wiring; endpoints delegate to the services);
+      2. prune every non-contract .py (the task-layer drift that causes the residual);
+      3. re-scaffold any contract module the model left broken, missing an export, or ORM-tainted;
+      4. write a clean, ORM-free manifest.
+
+    Result: models + services + routers + main are coherent, import-clean, ORM-free, and boot — the
+    proven-green scaffold — keeping the model's bodies only where they survived intact."""
+    import ast
+    persist = contract_scaffold.scaffold_persistence(workspace, log=log)  # (0) real data-access seam
+    contract_scaffold.scaffold_api(workspace, contract, log=log)          # (1) routers + main
+    paths = contract_scaffold.module_paths(contract)
+    keep = set(paths.values()) | {f"app/api/{k}.py" for k, v in contract.items()
+                                  if v.get("kind") == "service"} | {"main.py", persist}
+    pruned = 0
+    for root, dirs, files in os.walk(workspace, topdown=False):          # (2) prune drift
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for f in files:
+            if not f.endswith(".py"):
+                continue
+            abspath = os.path.join(root, f)
+            # __init__.py: reset to an EMPTY package marker. The model writes stale package
+            # re-exports into these (e.g. `from .menu_management import router` for a module that
+            # no longer exists) and they break the boot; the scaffold imports by full module path,
+            # so empty markers are all that's needed. Never prune them (packages must stay importable).
+            if f == "__init__.py":
+                try:
+                    if os.path.getsize(abspath) > 0:
+                        open(abspath, "w", encoding="utf-8").close()
+                except OSError:
+                    pass
+                continue
+            rel = os.path.relpath(abspath, workspace)
+            if rel not in keep:
+                try:
+                    os.remove(abspath); pruned += 1
+                except OSError:
+                    pass
+    # (3) re-scaffold any contract MODULE the model left broken: unparseable, ORM-tainted, missing a
+    # contract export, OR importing something that doesn't exist. The last case is the common one —
+    # the model keeps the right function names (exports present) but bolts on imports to modules it
+    # never created (`app.core.config`, `app.db.database`, ...), so the module passes a shape check
+    # yet fails at import time. Re-scaffolding replaces the body with a stub that imports ONLY its
+    # contract dependencies. Driven by the detector and looped to a fixpoint so a re-scaffold that
+    # clears one module can't leave a dependent broken.
+    file_to_key = {paths[k]: k for k in contract}
+
+    def _shape_bad(key, v):
+        p = os.path.join(workspace, paths[key])
+        if not os.path.isfile(p):
+            return True
+        try:
+            src = open(p, encoding="utf-8").read()
+            have = assemble._defined_names(ast.parse(src))
+        except (SyntaxError, OSError, ValueError):
+            return True
+        if "sqlalchemy" in src or "declarative_base" in src:
+            return True
+        return any(e.get("symbol") and e["symbol"] not in have for e in v.get("exports", []))
+
+    rescaffolded = 0
+    # Regenerate ALL service bodies deterministically (working CRUD delegating to the repository, or a
+    # stub for a genuinely custom op) — model service bodies are the unreliable part and this makes the
+    # endpoints actually WORK. Entities keep their model-filled bodies unless the model broke them.
+    bad = {k for k, v in contract.items() if v.get("kind") == "service" or _shape_bad(k, v)}
+    for _ in range(6):                      # bounded fixpoint
+        # add contract modules the detector flags (unresolved imports / missing exports)
+        for issue in heal.detect(workspace, py_exe=None, skeleton=skeleton, sanctioned=None):
+            k = file_to_key.get(issue.get("file"))
+            if k:
+                bad.add(k)
+        if not bad:
+            break
+        for k in bad:
+            contract_scaffold.scaffold(workspace, {k: contract[k]}, log=lambda m: None)
+            rescaffolded += 1
+        bad = set()
+    contract_scaffold.scaffold_api(workspace, contract, log=lambda m: None)   # routers depend on services
+    # (4) clean, ORM-free manifest.
+    mani = skeleton.get("manifest") or "requirements.txt"
+    deps = ["fastapi", "pydantic", "pydantic-settings", "python-multipart", "starlette", "uvicorn"]
+    try:
+        open(os.path.join(workspace, mani), "w", encoding="utf-8").write("\n".join(deps) + "\n")
+    except OSError:
+        pass
+    log(f"finalize: re-asserted contract structure (pruned {pruned} drift, re-scaffolded "
+        f"{rescaffolded} module(s), clean manifest)")
+    return {"pruned": pruned, "rescaffolded": rescaffolded, "manifest": deps}
+
+
+def _enforce_contract_exports(workspace: str, contract: dict, log=print) -> int:
+    """Builder CONTRACT-CONFORMANCE review: after generation, every contract module must still export
+    its contract symbols. If the model dropped/renamed one while filling bodies, re-add a stub so the
+    interface the rest of the app imports stays intact (heal then fills it). Deterministic."""
+    paths = contract_scaffold.module_paths(contract)
+    fixed = 0
+    for key, v in contract.items():
+        rel = paths[key]
+        abspath = os.path.join(workspace, rel)
+        if not os.path.isfile(abspath):
+            contract_scaffold.scaffold(workspace, {key: v}, log=lambda m: None)
+            fixed += 1
+            log(f"  [contract] re-scaffolded missing module {rel}")
+            continue
+        try:
+            have = assemble._defined_names(ast.parse(open(abspath, encoding="utf-8").read()))
+        except (SyntaxError, ValueError):
+            contract_scaffold.scaffold(workspace, {key: v}, log=lambda m: None)  # model broke it -> restore scaffold
+            fixed += 1
+            log(f"  [contract] re-scaffolded unparseable module {rel}")
+            continue
+        except OSError:
+            continue
+        missing = [e for e in v.get("exports", []) if e.get("symbol") and e["symbol"] not in have]
+        if not missing:
+            continue
+        try:
+            with open(abspath, "a", encoding="utf-8") as f:
+                f.write("\n\n# --- contract exports restored (must not be dropped) ---\n")
+                for e in missing:
+                    if e.get("kind") == "class":
+                        f.write(f"class {e['symbol']}:\n    pass\n\n")
+                    else:
+                        params = ", ".join(p["name"] for p in e.get("inputs", []) if p.get("name"))
+                        f.write(f"def {e['symbol']}({params}):\n    ...\n\n")
+            fixed += 1
+            log(f"  [contract] restored dropped exports in {rel}: {[e['symbol'] for e in missing]}")
+        except OSError:
+            pass
+    return fixed
+
+
+def _seed_contract_modules(cmap: dict, contract: dict, log=print) -> None:
+    """Register the scaffolded contract modules in the placement map so the tasks that realize each
+    concept EXTEND the scaffold (filling bodies) instead of a model-invented rival file. Uses the
+    same (concept, layer) registry the placer already consults, so a same-concept task in that layer
+    routes to the contract module."""
+    paths = contract_scaffold.module_paths(contract)
+    registry = cmap.setdefault("concepts", {})
+    for key, v in contract.items():
+        path = paths[key]
+        layer = "/".join(path.split("/")[:-1])
+        registry.setdefault(f"{key}::{layer}", path)
+        if not any(f["path"] == path for f in cmap["files"]):
+            cmap["files"].append({"path": path, "purpose": f"contract {v.get('kind')} {v.get('concept')}",
+                                  "concept": key, "task_ids": []})
+        if v.get("kind") == "service":     # its scaffolded router — route API tasks here to FILL it
+            rpath = f"app/api/{key}.py"
+            registry.setdefault(f"{key}::app/api", rpath)
+            if not any(f["path"] == rpath for f in cmap["files"]):
+                cmap["files"].append({"path": rpath, "purpose": f"contract router {v.get('concept')}",
+                                      "concept": key, "task_ids": []})
 
 
 def _internal_tops(ws: str) -> set:
@@ -286,6 +447,19 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     # agent, so every file builds into ONE coherent app in a single continued session.
     context.write_project_context(workspace, skeleton, handover)
 
+    # CONTRACT-DRIVEN SCAFFOLDING: the Architect's code_contract defines the modules (entities +
+    # services) with exact exports + dependencies. Scaffold them deterministically — coherent by
+    # construction (verified: collisions impossible, imports/exports line up) — and register them so
+    # the tasks realizing each concept FILL the scaffold instead of inventing a rival file.
+    contract = (handover or {}).get("code_contract") or {}
+    if contract:
+        contract_scaffold.scaffold_persistence(workspace, log=log)          # real data-access seam
+        scaf = contract_scaffold.scaffold(workspace, contract, log=log)
+        api = contract_scaffold.scaffold_api(workspace, contract, log=log)   # routers + entrypoint
+        _seed_contract_modules(cmap, contract, log)
+        log(f"contract: scaffolded {scaf['modules']} modules + {api['routers']} routers + main "
+            f"(full structure coherent by construction) from {len(contract)} concepts")
+
     # STACK POLICY (Architect proportionality review, carried in the handover): the sanctioned
     # third-party allow-list the build must CONFORM to. Enforced at acceptance (unsanctioned import
     # -> not 'built') and used to write the manifest top-down. None when no usable policy is present.
@@ -339,6 +513,11 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
 
     # 2. ASSEMBLE + RUN-VERIFY + GUARDED REPAIR: ensure a manifest + entrypoint, then boot the app
     # and repair (guarded) until it runs. All in the same continued session as the build.
+    # CONTRACT CONFORMANCE (P4b): body-fill must not have dropped any contract export.
+    if contract:
+        n = _enforce_contract_exports(workspace, contract, log)
+        log(f"contract-conformance: {'restored ' + str(n) + ' module(s)' if n else 'all exports intact'}")
+
     log("assembling: entrypoint + foundational modules + manifest")
     entry = assemble.ensure_entrypoint(workspace, skeleton, log=log)
     foundations = assemble.ensure_internal_modules(workspace, skeleton, log=log)
@@ -371,12 +550,41 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     # INTEGRATED HEAL LOOP: detect ALL issues -> fix each (deterministic where mechanical, model
     # where judgment) guarded -> re-detect -> until clean or bounded. Subsumes export reconciliation,
     # missing-import resolution, and boot repair into one loop with generic detectors.
-    log("integrated heal loop (detect -> fix -> re-detect)")
+    # DETERMINISTIC SWEEP ONLY (max_rounds=0): mechanical import/alias/collision fixes to a fixpoint,
+    # NO model-repair rounds. The model rounds used to create a missing module per issue, and the
+    # created module imported yet more nonexistent modules -> an unbounded foundation cascade (~50min
+    # for this project). It is redundant now: the finalize step below re-scaffolds any broken contract
+    # module and prunes drift deterministically, so correctness no longer depends on model repair.
+    log("deterministic heal sweep (no model rounds; finalize guarantees the contract structure)")
     run = heal.heal(workspace, skeleton, sanctioned=sanctioned,
-                    internal_tops=_internal_tops(workspace), log=log)
+                    internal_tops=_internal_tops(workspace), max_rounds=0, log=log)
     log(f"heal: runnable={run.get('runnable')} fixes={run.get('fixes_applied')} "
         f"reverts={len(run.get('reverts', []))}"
         + (f" final_error={run.get('final_error')}" if run.get("runnable") == "no" else ""))
+
+    # FINAL contract conformance: the model reliably BREAKS the scaffold (drops exports, un-mounts
+    # routers, injects an ORM, imports files it never wrote). Rather than chase that, re-assert the
+    # deterministic contract structure as the last step and drop the drift — guaranteeing a coherent,
+    # booting, route-complete, ORM-free app regardless of what the model did. Model bodies survive
+    # only where they stayed intact (parse + keep exports + no ORM + imports resolve post-prune).
+    finalize = _finalize_contract_app(workspace, contract, skeleton, log) if contract else None
+
+    # FRONTEND STAGE — after the backend, build the UI from the frontend requirements + the real
+    # endpoints the backend now exposes (derived from the contract). Real pages (menu/admin/
+    # reservation/contact), model-generated, not the API console.
+    frontend_report = None
+    if contract:
+        try:
+            reqs_path = os.path.join(os.path.dirname(workspace.rstrip("/")), "requirements", "package.json")
+            reqs = json.load(open(reqs_path)).get("requirements", []) if os.path.isfile(reqs_path) else []
+            log(f"frontend stage: {len(reqs)} requirement(s) available; generating UI from the API")
+            gate = frontend_gate.make_validator(workspace, skeleton, log)   # browser gate (or None)
+            try:
+                frontend_report = frontend.generate(workspace, handover or {}, reqs, log=log, validate=gate)
+            finally:
+                frontend_gate.shutdown(gate)
+        except Exception as ex:                          # never let UI generation break the build
+            log(f"frontend stage error ({type(ex).__name__}: {ex})")
 
     built = sum(1 for r in results if r["outcome"] == "built")
     failed = sum(1 for r in results if r["outcome"] == "failed")
@@ -390,7 +598,8 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
                     "no_output": noout,
                     "build_success_rate": round(built / judged, 3) if judged else None,
                     "files": len(_list_code_files(workspace)),
-                    "runnable": run.get("runnable")},
+                    "runnable": run.get("runnable"), "finalize": finalize,
+                    "frontend": frontend_report},
         "assembly": {"manifest": manifest, "entrypoint": entry, "foundations": foundations,
                      "run_verify": run},
         "results": results,

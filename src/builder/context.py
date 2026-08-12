@@ -85,6 +85,10 @@ def agents_md(skeleton: dict, handover: dict | None = None) -> str:
     out += [
         "",
         "## Contracts — MUST follow so the files form ONE runnable app",
+        "- Some modules under app/models/ and app/services/ are PRE-CREATED as design-contract "
+        "scaffolds carrying the exact imports and class/function signatures the rest of the app "
+        "depends on. When you open such a file, FILL its bodies — never rename, re-signature, or "
+        "remove its classes/functions or imports; other modules import them by those exact names.",
         "- Build ONE coherent application; every file fits the layout above.",
         "- REUSE what already exists. Never redefine a shared base/type/config/model that another "
         "file already defines — import it from its canonical module.",

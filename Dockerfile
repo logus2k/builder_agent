@@ -5,6 +5,13 @@
 # via host networking — nothing model-related ships in this image.
 FROM python:3.12-slim
 WORKDIR /app
+# Headless Chromium for the in-pipeline FRONTEND GATE: generated pages are rendered and their JS
+# console is checked, so a page that throws (undefined function, bad URL, blocked resource) is
+# rejected and regenerated instead of shipped. Without this the gate is skipped (structural check only).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends chromium \
+ && rm -rf /var/lib/apt/lists/*
+ENV CHROMIUM_FLAGS="--headless --no-sandbox"
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
