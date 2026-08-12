@@ -159,7 +159,10 @@ def stubs_agent_md() -> str:
     return (
         "---\n"
         "description: Implements stub functions (NotImplementedError) in ONE target file\n"
-        "mode: subagent\n"
+        # mode 'all' (NOT 'subagent'): a subagent cannot be the top-level agent of `opencode run --agent`
+        # — opencode silently falls back to its default read-everything 'build' agent, which blows the
+        # context and edits nothing. 'all' lets it be invoked directly AND keeps its restricted tools.
+        "mode: all\n"
         "temperature: 0\n"
         "tools:\n"
         "  read: true\n  edit: true\n  glob: true\n  grep: true\n  write: false\n  bash: false\n"

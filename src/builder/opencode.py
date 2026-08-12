@@ -248,17 +248,74 @@ def _file_instruction(path: str, tasks: list[dict], skeleton: dict | None, exist
 
 
 def _stub_instruction(path: str, tasks: list[dict]) -> str:
-    """A SHORT stub-completion prompt for the focused `stubs` subagent. No full task dump — the
-    signatures are self-describing and a long spec is what blows the context; pass only the task
-    TITLES as a hint of intent. MEASURED: this + the stubs subagent fills a service in ~25s with one
-    read, versus the primary agent reading ~33 files, compacting, and never editing."""
-    titles = "; ".join(t.get("title", "") for t in tasks if t.get("title"))[:600]
+    """A SHORT, self-contained stub-completion prompt. Deliberately does NOT dump the task titles:
+    MEASURED, the Planner's task names ('getMenuStructure') often do not match the contract function
+    names ('get_menu_details'), so listing them makes the model hunt for functions that aren't there,
+    read the whole tree, and never edit. The function SIGNATURES in the file are self-describing for the
+    CRUD the repo() seam supports, which is what actually gets kept."""
     return (f"Implement every stub (a `raise NotImplementedError` body) in the file: {path}. "
-            f"Replace each with real, working logic using `repo(name)` "
-            f"(create(dict)/get(id)/list()/update(id, dict)/delete(id)) from app.repositories.store — "
-            f"store FULL field dicts, filter/nest via `.list()`. Use `grep`/`glob` to check a specific "
-            f"name; do NOT read whole files. Apply with `edit`, keep the existing names/params/imports. "
-            + (f"What these functions are for: {titles}." if titles else ""))
+            f"The function NAME and its parameters tell you what it does. Replace each stub with real, "
+            f"working logic using the data seam `repo(name)` from app.repositories.store — "
+            f"`.create(dict)` (store a FULL dict of the params), `.get(id)`, `.list()` (filter/nest in "
+            f"Python), `.update(id, dict)`, `.delete(id)`. Use `grep`/`glob` ONLY to confirm a specific "
+            f"symbol; do NOT read whole files. Apply changes with `edit`. Keep every existing function "
+            f"name, parameter list and import EXACTLY; just fill the bodies.")
+
+
+def _fill_stubs(path: str, workdir: str) -> tuple[list[str], dict]:
+    """Fill a scaffold's `raise NotImplementedError` stubs via a DIRECT model completion — the frontend's
+    reliable pattern — instead of opencode's agentic edit loop, which (MEASURED) reads models, greps, and
+    then never edits a non-trivial service. The model returns the COMPLETE module; we validate it (parses,
+    keeps every original def/class name, no leftover stub) and write it, else keep the scaffold untouched.
+    Returns (changed_files, diag)."""
+    import ast as _ast
+    full = os.path.join(workdir, path)
+    try:
+        before = open(full, encoding="utf-8").read()
+    except OSError:
+        return [], {"exit": 1, "reason": "unreadable"}
+    if "raise NotImplementedError" not in before:
+        return [], {"skipped": True, "reason": "data-only scaffold (no stubs to implement)"}
+    orig_names = {n.name for n in _ast.walk(_ast.parse(before))
+                  if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))}
+    prompt = ("Implement this Python module: replace every `raise NotImplementedError(...)` body with "
+              "real, working logic. Use the data seam `repo(name)` from app.repositories.store — "
+              "`.create(dict)` (store a full dict built from the parameters), `.get(id)`, `.list()` "
+              "(filter/nest in Python), `.update(id, dict)`, `.delete(id)`. Keep EVERY function name, "
+              "parameter list, class and import EXACTLY as given; fill only the bodies, add small internal "
+              "helpers only if needed. Output ONLY the complete Python file — no markdown fences, no prose.\n\n"
+              + before)
+    body = json.dumps({"model": _resolve_model(), "messages": [{"role": "user", "content": prompt}],
+                       "temperature": 0.2, "max_tokens": 8192,
+                       "chat_template_kwargs": {"enable_thinking": False}}).encode()
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(f"{MODEL_URL}/v1/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        code = json.load(urllib.request.urlopen(req, timeout=180))["choices"][0]["message"]["content"]
+    except Exception as e:
+        return [], {"exit": 1, "dur": round(time.time() - t0, 1), "reason": f"model error: {type(e).__name__}"}
+    if "</think>" in code:
+        code = code.rsplit("</think>", 1)[1]
+    if "```" in code:                                    # strip a markdown fence if present
+        parts = code.split("```")
+        code = parts[1] if len(parts) > 1 else code
+        if code.lower().lstrip().startswith("python"):
+            code = code.lstrip()[6:]
+    code = code.strip()
+    dur = round(time.time() - t0, 1)
+    try:
+        new_names = {n.name for n in _ast.walk(_ast.parse(code))
+                     if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))}
+    except SyntaxError:
+        return [], {"exit": 1, "dur": dur, "reason": "model output does not parse"}
+    if "raise NotImplementedError" in code:
+        return [], {"exit": 1, "dur": dur, "reason": "stubs still unimplemented"}
+    if not orig_names.issubset(new_names):               # must preserve the interface others import
+        return [], {"exit": 1, "dur": dur, "reason": f"dropped symbols: {sorted(orig_names - new_names)}"}
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(code + "\n")
+    return [path], {"exit": 0, "dur": dur}
 
 
 def build_file(path: str, tasks: list[dict], workdir: str, skeleton: dict | None = None,
@@ -268,11 +325,13 @@ def build_file(path: str, tasks: list[dict], workdir: str, skeleton: dict | None
     file already exists as a contract scaffold, implement its stub bodies with the focused `stubs`
     SUBAGENT (a short prompt, its own fresh context) — never the primary agent + a huge merged spec,
     which reads the whole tree, compacts, and edits nothing. New files use the primary builder agent."""
-    exists = os.path.isfile(os.path.join(workdir, path)) and os.path.getsize(os.path.join(workdir, path)) > 0
+    full = os.path.join(workdir, path)
+    exists = os.path.isfile(full) and os.path.getsize(full) > 0
     if exists:
-        # Fresh context per file (no --continue) keeps the stub agent's window small and reliable.
-        return run_opencode(_stub_instruction(path, tasks), workdir, first=True,
-                            attach=attach, timeout=timeout, agent="stubs")
+        # A contract scaffold: fill its stub bodies with a DIRECT model completion (reliable) rather than
+        # opencode's agentic edit loop (which explores the tree and often never edits). _fill_stubs also
+        # returns a fast skip for a data-only module (no stubs), so entities cost ~0s.
+        return _fill_stubs(path, workdir)
     return run_opencode(_file_instruction(path, tasks, skeleton, exists=exists), workdir,
                         first=first, attach=attach, timeout=timeout)
 
@@ -286,6 +345,6 @@ def build_file_with_retry(path: str, tasks: list[dict], workdir: str, skeleton: 
     for attempt in range(retries + 1):
         files, last_diag = build_file(path, tasks, workdir, skeleton=skeleton,
                                       first=first and attempt == 0, attach=attach)
-        if files:
+        if files or last_diag.get("skipped"):     # a deliberate skip is not a failure — do not retry
             return files, attempt + 1, last_diag
     return [], retries + 1, last_diag

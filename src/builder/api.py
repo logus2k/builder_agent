@@ -106,7 +106,7 @@ class JobManager:
             # Two DISTINCT development stages surfaced to the FACTORY Overview: BACKEND (build the
             # API from the plan) then FRONTEND (generate the UI). The Overview's Development lane reads
             # job.stage + job.progress, so each shows as its own activity with its own done/total.
-            counter = {"done": 0, "total": 0, "phase": "backend",
+            counter = {"done": 0, "total": 0, "phase": "backend", "retries": 0,
                        "fe_done": 0, "fe_total": 0}
 
             def _log(msg: str = "") -> None:
@@ -136,11 +136,18 @@ class JobManager:
                         counter["total"] = int(n) if n.isdigit() else counter["total"]
                     job.progress = {"stage": "backend", "status": "progress",
                                     "done": 0, "total": counter["total"]}
-                elif st.startswith("[") and counter["phase"] == "backend":
+                elif counter["phase"] == "backend" and (st.startswith("[built") or
+                        st.startswith("[no_output") or st.startswith("[failed")):
+                    # Count only FILE-OUTCOME lines (not [scaffold]/[heal]/etc.), so done ≤ total files.
                     counter["done"] += 1
+                    if "retries=" in st:      # report retries transparently, never hide them
+                        try:
+                            counter["retries"] += int(st.split("retries=")[1].split(")")[0].strip())
+                        except (ValueError, IndexError):
+                            pass
                     job.progress = {"stage": "backend", "status": "progress",
                                     "done": counter["done"], "total": counter["total"],
-                                    "last": st[:120]}
+                                    "retries": counter["retries"], "last": st[:120]}
                 # Push a live lane update only when the stage or the done-count actually changed
                 # (once per file + at stage boundaries) — not on every log line — to keep the relay light.
                 sig = (job.stage, (job.progress or {}).get("done"))

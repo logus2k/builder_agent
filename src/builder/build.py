@@ -543,24 +543,23 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     # PHASE 1 — PLACEMENT: assign every task to a file (concept+layer consolidation). Cheap persona
     # calls, no opencode. Result: a file -> [tasks] grouping. A canonical concept vocabulary (from
     # the architecture) keeps concept keys stable so same-concept tasks collapse into one file.
-    concept_vocab = _concept_vocab(handover)
     mpaths = contract_scaffold.module_paths(contract) if contract else {}
     groups: dict[str, list[dict]] = {}
-    on_contract = 0
+    skipped = []
     for t in order:
-        # Route onto the Architect's contract scaffold first (the files the app wires and finalize
-        # keeps). Only tasks that map to no concept fall back to the agentic placer — so opencode
-        # FILLS the real modules instead of inventing a parallel tree that gets pruned.
-        cp = _place_on_contract(t, contract, mpaths)
+        # Route onto the Architect's contract scaffold (the files the app wires and finalize keeps).
+        # A task that maps to NO contract concept is non-contract work (config/test/middleware/main)
+        # that either the deterministic scaffold+assemble already produce (main, manifest) or finalize
+        # would prune anyway — building it via a full agent pass wasted minutes for output we discard.
+        # Skip it (logged, never silent).
+        cp = _place_on_contract(t, contract, mpaths) if contract else None
         if cp:
             groups.setdefault(cp, []).append(t)
-            on_contract += 1
         else:
-            p = structure.place_task(t, cmap, design_hint=_design_hint(t, handover, req_aspect),
-                                     concept_vocab=concept_vocab)
-            groups.setdefault(p["path"], []).append(t)
+            skipped.append(t.get("task_id"))
     groups = _normalize_collisions(groups, log)      # one canonical location per concept (no module/package collision)
-    log(f"placed {len(order)} tasks into {len(groups)} files ({on_contract} onto the contract scaffold)")
+    log(f"placed {len(order) - len(skipped)} tasks into {len(groups)} files"
+        + (f"; skipped {len(skipped)} non-contract task(s) {skipped} (handled by scaffold/assemble or pruned)" if skipped else ""))
 
     # PHASE 2 — GENERATION: write each file ONCE from ALL its tasks' merged specs (one opencode
     # pass per file — not N incremental extends, which corrupt large files). Base layer first.
@@ -571,7 +570,13 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
         files, tries, diag = opencode.build_file_with_retry(
             path, gtasks, workspace, skeleton=skeleton, first=(i == 0),
             retries=retries, attach=attach)
-        if not files:
+        if not files and diag.get("skipped"):
+            # Data-only scaffold: nothing to implement, the valid scaffold is kept as-is. Counts as
+            # built (it IS a correct, present module), NOT no_output.
+            v = {"produced": True, "clean": True, "reason": diag.get("reason", "data-only scaffold")}
+            outcome = "built"
+            log(f"  [built    ] {path}  (scaffold kept — no stubs to implement)")
+        elif not files:
             v = {"produced": False, "clean": False, "reason": "no output after retries",
                  "no_output_diag": {"exit": diag.get("exit"), "timeout": diag.get("timeout"),
                                     "dur": diag.get("dur"),
@@ -591,7 +596,8 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
                             "traces_to": t.get("traces_to", []), "outcome": outcome,
                             "tries": tries, **v})
         n = len(gtasks)
-        log(f"  [{outcome:9}] {path}  ({n} task{'' if n == 1 else 's'}) ({v.get('reason','')})")
+        rtx = f" (retries={tries - 1})" if tries and tries > 1 else ""
+        log(f"  [{outcome:9}] {path}  ({n} task{'' if n == 1 else 's'}){rtx} ({v.get('reason','')})")
 
     # 2. ASSEMBLE + RUN-VERIFY + GUARDED REPAIR: ensure a manifest + entrypoint, then boot the app
     # and repair (guarded) until it runs. All in the same continued session as the build.
