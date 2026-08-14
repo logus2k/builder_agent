@@ -203,6 +203,49 @@ def builder_run(pid: str, request: Request, cap: int | None = None, retries: int
     return {"job_id": job.job_id, "project_id": pid, "status": job.status}
 
 
+@api.post("/projects/{pid}/builder:fix")
+async def builder_fix(pid: str, request: Request) -> dict:
+    """Testing->Development feedback loop: fix functional-test failures. Body:
+    `{failures: [{endpoint, detail, traceback}], report: "<tester report>"}`. Each failure is fixed
+    ONE at a time via direct-completion (build.fix_failures) and `code/` is republished. Synchronous
+    (fast — ~1s/fix). Returns {fixed, skipped, repo}. The tester posts one issue per call so each is
+    solved individually with the report attached (per the feedback-loop design)."""
+    body = await request.json()
+    failures = body.get("failures") or []
+    report = body.get("report") or ""
+    if not failures:
+        raise HTTPException(400, "no failures provided")
+    _factory_emit(pid, "backend", "running", f"Fixing {len(failures)} test failure(s)")
+    try:
+        out = build_mod.fix_failures(pid, failures, report=report)
+    except Exception as e:  # noqa: BLE001
+        _factory_emit(pid, "error", "error", f"{type(e).__name__}: {e}")
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+    nf, ns = len(out.get("fixed", [])), len(out.get("skipped", []))
+    _factory_emit(pid, "done", "done", f"{nf} fixed · {ns} skipped", {"fixed": nf, "skipped": ns})
+    return {"project_id": pid, **out}
+
+
+@api.post("/projects/{pid}/builder:fix-page")
+async def builder_fix_page(pid: str, request: Request) -> dict:
+    """Testing->Development FRONTEND loop: regenerate one flagged page. Body `{slug, report}`. Synchronous
+    (~one page). The tester posts one flagged page per call with its failure report (dead button / dead
+    link / invented endpoint / non-completing journey); the page is rebuilt with skills + guardrail."""
+    body = await request.json()
+    slug = (body.get("slug") or "").strip()
+    report = body.get("report") or ""
+    if not slug:
+        raise HTTPException(400, "no slug provided")
+    _factory_emit(pid, "frontend", "running", f"Fixing page {slug}")
+    try:
+        out = build_mod.fix_page(pid, slug, report)
+    except Exception as e:  # noqa: BLE001
+        _factory_emit(pid, "error", "error", f"{type(e).__name__}: {e}")
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+    _factory_emit(pid, "done", "done", f"page {slug} regenerated={out.get('regenerated')}")
+    return {"project_id": pid, **out}
+
+
 @api.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
     job = jm.jobs.get(job_id)

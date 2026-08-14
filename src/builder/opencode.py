@@ -318,6 +318,65 @@ def _fill_stubs(path: str, workdir: str) -> tuple[list[str], dict]:
     return [path], {"exit": 0, "dur": dur}
 
 
+def fix_module(path: str, workdir: str, func: str, error: str, report: str = "") -> tuple[list[str], dict]:
+    """Testing->Development feedback: fix ONE buggy function in a module via the same DIRECT model
+    completion as `_fill_stubs`. Given the current file, the failing function, its runtime traceback and
+    the tester's report, the model returns the COMPLETE fixed module; we validate (parses, keeps every
+    original def/class name) and write it, else leave the file untouched. Returns (changed_files, diag)."""
+    import ast as _ast
+    full = os.path.join(workdir, path)
+    try:
+        before = open(full, encoding="utf-8").read()
+    except OSError:
+        return [], {"exit": 1, "reason": "unreadable"}
+    orig_names = {n.name for n in _ast.walk(_ast.parse(before))
+                  if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))}
+    ctx = f"\n\nFUNCTIONAL TEST REPORT:\n{report[:1200]}" if report else ""
+    prompt = (
+        f"This Python module has a BUG: the endpoint served by `{func}` returns HTTP 500 in functional "
+        f"testing. Fix the bug in `{func}` (and only what the fix requires). The function is called as a "
+        f"REAL HTTP request: EVERY parameter arrives as a STRING (an id is \"1\", not an int or a dict). "
+        f"CRITICAL: never call a dict/object method (`.get(...)`, `[...]`, attribute access) on a "
+        f"parameter without first checking its type — if the traceback says \"'str' object has no "
+        f"attribute 'X'\" then that parameter is a plain string at runtime, so guard with `isinstance` or "
+        f"coerce it before use. Handle missing / not-found cases gracefully: return None, an empty list, "
+        f"or a default — NEVER raise on not-found or on a bad shape (that becomes a 500). Use the data "
+        f"seam `repo(name)` from app.repositories.store. Keep EVERY function name, parameter list, class "
+        f"and import EXACTLY as given. Output ONLY the complete Python file — no markdown fences, no prose."
+        f"\n\nRUNTIME ERROR (traceback):\n{error[:1500]}{ctx}\n\nCURRENT FILE:\n{before}")
+    body = json.dumps({"model": _resolve_model(), "messages": [{"role": "user", "content": prompt}],
+                       "temperature": 0.2, "max_tokens": 8192,
+                       "chat_template_kwargs": {"enable_thinking": False}}).encode()
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(f"{MODEL_URL}/v1/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        code = json.load(urllib.request.urlopen(req, timeout=180))["choices"][0]["message"]["content"]
+    except Exception as e:
+        return [], {"exit": 1, "dur": round(time.time() - t0, 1), "reason": f"model error: {type(e).__name__}"}
+    if "</think>" in code:
+        code = code.rsplit("</think>", 1)[1]
+    if "```" in code:                                    # strip a markdown fence if present
+        parts = code.split("```")
+        code = parts[1] if len(parts) > 1 else code
+        if code.lower().lstrip().startswith("python"):
+            code = code.lstrip()[6:]
+    code = code.strip()
+    dur = round(time.time() - t0, 1)
+    try:
+        new_names = {n.name for n in _ast.walk(_ast.parse(code))
+                     if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))}
+    except SyntaxError:
+        return [], {"exit": 1, "dur": dur, "reason": "fix does not parse"}
+    if not orig_names.issubset(new_names):               # must preserve the interface others import
+        return [], {"exit": 1, "dur": dur, "reason": f"dropped symbols: {sorted(orig_names - new_names)}"}
+    if "raise NotImplementedError" in code:
+        return [], {"exit": 1, "dur": dur, "reason": "fix reintroduced a stub"}
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(code + "\n")
+    return [path], {"exit": 0, "dur": dur}
+
+
 def build_file(path: str, tasks: list[dict], workdir: str, skeleton: dict | None = None,
                first: bool = False, attach: str | None = None,
                timeout: float = 600) -> tuple[list[str], str]:

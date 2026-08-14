@@ -424,6 +424,74 @@ def publish_to_repo(pid: str, message: str = "Builder: build code from plan") ->
         return json.load(r)
 
 
+def _module_defining(workspace: str, func: str, preferred: str | None) -> str | None:
+    """Repo-relative path of the module that defines `def func(` — prefer `preferred` (the contract
+    module for the endpoint's group), else scan services/models/api. Plain substring, not a regex."""
+    needle = f"def {func}("
+    cands: list[str] = [preferred] if preferred else []
+    for base in ("app/services", "app/models", "app/api"):
+        d = os.path.join(workspace, base)
+        if os.path.isdir(d):
+            cands += [os.path.join(base, fn) for fn in sorted(os.listdir(d)) if fn.endswith(".py")]
+    seen: set[str] = set()
+    for rel in cands:
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        try:
+            if needle in open(os.path.join(workspace, rel), encoding="utf-8").read():
+                return rel
+        except OSError:
+            continue
+    return None
+
+
+def fix_failures(pid: str, failures: list[dict], report: str = "", log=print) -> dict:
+    """Testing->Development feedback loop: fix each failing endpoint's function via a direct-completion
+    fix (opencode.fix_module), ONE at a time, using its traceback + the tester report, then republish
+    `code/` once. `failures` = [{endpoint|id, detail, traceback}]. Independent-harness sanctioned: it
+    consumes the tester's FINDINGS artifact, never builder internals. Returns {fixed, skipped, repo}."""
+    workspace = repo_code_workspace(pid)
+    handover = load_handover(pid)
+    contract = (handover or {}).get("code_contract") or {}
+    mpaths = contract_scaffold.module_paths(contract) if contract else {}
+    fixed, skipped = [], []
+    for f in failures:
+        ep = (f.get("endpoint") or f.get("id") or "").strip("/")
+        parts = [p for p in ep.split("/") if p]
+        if len(parts) < 2:
+            skipped.append({"endpoint": ep, "reason": "unmappable endpoint"}); continue
+        group, op = parts[0], parts[1]
+        path = _module_defining(workspace, op, mpaths.get(group))
+        if not path:
+            skipped.append({"endpoint": ep, "reason": f"no module defines {op}"}); continue
+        err = f.get("traceback") or f.get("detail") or "HTTP 500"
+        log(f"fix {ep} -> {path}::{op}")
+        files, diag = opencode.fix_module(path, workspace, op, err, report)
+        if files:
+            fixed.append({"endpoint": ep, "path": path, "func": op, "dur": diag.get("dur")})
+            log(f"  fixed ({diag.get('dur')}s)")
+        else:
+            skipped.append({"endpoint": ep, "path": path, "reason": diag.get("reason")})
+            log(f"  fix failed: {diag.get('reason')}")
+    commit = publish_to_repo(pid, "Builder: fix functional-test failures") if fixed else {}
+    return {"fixed": fixed, "skipped": skipped, "attempted": len(failures), "repo": commit}
+
+
+def fix_page(pid: str, slug: str, report: str = "", log=print) -> dict:
+    """Testing->Development FRONTEND loop: regenerate one flagged page (dead button/link, invented
+    endpoint, non-completing flow) with the tester report + skills + guardrail, then republish code/.
+    The frontend analog of fix_failures. Returns {slug, regenerated, repo}."""
+    workspace = repo_code_workspace(pid)
+    handover = load_handover(pid) or {}
+    reqs_path = os.path.join(os.path.dirname(workspace.rstrip("/")), "requirements", "package.json")
+    reqs = json.load(open(reqs_path)).get("requirements", []) if os.path.isfile(reqs_path) else []
+    out = frontend.regenerate_page(workspace, handover, reqs, slug, report, log=log)
+    commit = publish_to_repo(pid, f"Builder: fix frontend page {slug} from test report") \
+        if out.get("regenerated") else {}
+    return {**out, "repo": commit}
+
+
 def toposort(tasks: list[dict], edges: list[list[str]]) -> list[dict]:
     """Order tasks so that dependencies come first. edges = [a, b] meaning a depends on b."""
     by_id = {t["task_id"]: t for t in tasks}

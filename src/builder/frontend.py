@@ -14,9 +14,13 @@ unusable, so the app always has a serving, non-broken UI.
 
 from __future__ import annotations
 
+import concurrent.futures
+import glob
 import json
 import os
 import urllib.request
+
+from . import skills
 
 # The OpenAI-compatible persona server. NOT BUILDER_LLM_URL (:8500) — that is opencode's raw model
 # backend and does not speak /v1/chat/completions.
@@ -95,10 +99,11 @@ def _call_model(prompt: str, log) -> str:
     # The server returns the reasoning in a separate `reasoning_content` field, so `content` is already
     # clean html when </think> closes; the </think> strip below is belt-and-suspenders for the rare case
     # the block is inlined. Keep temp >= 0.5 with thinking on — 0.2 reintroduces the loop.
+    _think = os.environ.get("FRONTEND_THINKING", "1") not in ("0", "false", "False")
     body = json.dumps({"model": _resolve_model(), "messages": [{"role": "user", "content": prompt}],
                        "temperature": float(os.environ.get("FRONTEND_TEMP", "0.7")),
                        "max_tokens": int(os.environ.get("FRONTEND_MAX_TOKENS", "64000")),
-                       "chat_template_kwargs": {"enable_thinking": True}}).encode()
+                       "chat_template_kwargs": {"enable_thinking": _think}}).encode()
     req = urllib.request.Request(f"{MODEL_URL}/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
     out = json.load(urllib.request.urlopen(req, timeout=240))
@@ -157,6 +162,20 @@ def _sanitize(html: str) -> str:
                  "https://www.example.com", "https://example.com", "http://example.com",
                  "https://your-api.com", "http://localhost:8000", "http://127.0.0.1:8000"):
         html = html.replace(host, "")
+    # DETERMINISTIC modal-overlay guard (generic, any app): the model often marks a modal/overlay/dropdown
+    # `class="hidden"` but styles it with opacity/visibility (or forgets the rule), so the invisible
+    # overlay still covers the page and INTERCEPTS clicks — making the real buttons unclickable. Force the
+    # common "hidden" conventions to display:none so a hidden element can never eat pointer events. The
+    # standard show pattern removes the class (classList.remove('hidden')), so this never hides a shown one.
+    guard = ("<style>.hidden,[hidden],.d-none,.is-hidden,.modal.hidden,.overlay.hidden"
+             "{display:none !important;}</style>")
+    if guard not in html:
+        low = html.lower()
+        h = low.rfind("</head>")
+        if h != -1:
+            html = html[:h] + guard + html[h:]
+        else:
+            html = guard + html
     return html
 
 
@@ -198,10 +217,11 @@ Implement these product requirements:
 {reqlist}
 
 The backend already exists and SERVES THIS PAGE. Call these REAL endpoints with fetch() using
-RELATIVE, same-origin paths — e.g. fetch("{eps[0]['path'] if eps else '/service/operation'}?...") —
-and NEVER prefix a domain, host, or API base URL (no "https://api.example.com", no
-"http://localhost"). HTTP POST, parameters in the query string, no request body; render whatever JSON
-they return, degrading gracefully when fields are absent:
+RELATIVE, same-origin paths — e.g. fetch("{eps[0]['path'] if eps else '/service/operation'}?...",
+{{method:"POST"}}) — and NEVER prefix a domain, host, or API base URL. CRITICAL — the backend serves
+these ONLY over HTTP POST: EVERY fetch(), including data-loading calls on page load, MUST pass
+{{ method: "POST" }}; a bare fetch(url) defaults to GET and the server returns 404. Parameters go in the
+query string, no request body. Render whatever JSON they return, degrading gracefully when absent:
 {eplist}
 
 Rules: a clean, professional, responsive layout appropriate to the domain (works on mobile); include
@@ -243,6 +263,184 @@ def _derive_pages(handover: dict, requirements: list[dict]) -> tuple[list[dict],
     return pages, app_name
 
 
+def _load_product_spec(workspace: str) -> dict | None:
+    """The Product Agent's spec lives in the repo's product/ area (a sibling of code/). When present it
+    DRIVES the frontend: pages come from its screen map (framed as user tasks, with public/authenticated
+    surfaces and a real landing), not from the technical aspects. Absent -> fall back to aspect pages."""
+    p = os.path.join(workspace, os.pardir, "product", "product_spec.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            spec = json.load(f)
+        return spec if spec.get("screens") else None
+    except (OSError, ValueError):
+        return None
+
+
+def _derive_pages_from_spec(spec: dict, handover: dict, requirements: list[dict]):
+    """Pages from the PRODUCT screen map: each screen is a page (user task), its endpoints are the
+    contract concepts whose req_ids overlap the screen's requirements. The landing screen becomes the
+    homepage (index.html). Returns (pages, app_name, nav_public, nav_admin)."""
+    contract = handover.get("code_contract") or {}
+    all_eps = _endpoints_from_contract(contract)
+    ep_reqids = {ep["path"]: set((contract.get(ep["path"].strip("/").split("/")[0]) or {}).get("req_ids") or [])
+                 for ep in all_eps}
+    req_by_id = {r["req_id"]: r for r in requirements if isinstance(r, dict) and r.get("req_id")}
+    # A screen belongs to the PUBLIC storefront or the ADMIN dashboard by its SURFACE, not by whether it
+    # needs a login (a "book a table" screen is on the public site but may require sign-in to complete).
+    surf_aud = {s.get("id"): s.get("audience") for s in (spec.get("surfaces") or [])}
+    landing = spec.get("landing_screen")
+    screens = spec.get("screens") or []
+
+    def _is_public(s):
+        return surf_aud.get(s.get("surface"), s.get("audience", "public")) == "public"
+
+    if not any(s.get("is_landing") or s.get("id") == landing for s in screens):
+        pub = next((s for s in screens if _is_public(s)), screens[0] if screens else None)
+        if pub:
+            pub["is_landing"] = True
+    pages = []
+    for s in screens:
+        sid = s.get("id") or _slug(s.get("title", ""))
+        sreqids = set(s.get("requirements") or [])
+        reqs = [req_by_id[i] for i in sreqids if i in req_by_id]
+        eps = [ep for ep in all_eps if ep_reqids[ep["path"]] & sreqids] or all_eps[:6]
+        is_landing = bool(s.get("is_landing")) or sid == landing
+        pages.append({"slug": "index" if is_landing else _slug(sid), "screen_id": sid,
+                      "title": s.get("title") or sid, "purpose": s.get("purpose", ""),
+                      "persona": s.get("primary_persona", ""),
+                      "surface_audience": "public" if _is_public(s) else "admin",
+                      "requires_login": s.get("audience") == "authenticated",
+                      "actions": s.get("key_actions") or [], "reqs": reqs, "eps": eps,
+                      "is_landing": is_landing})
+    app_name = spec.get("product_name") or (handover.get("source_package", {}) or {}).get("project_name") or "Application"
+    href = lambda p: "/" if p["is_landing"] else f"/{p['slug']}.html"
+    nav_public = [{"label": p["title"], "href": href(p)} for p in pages if p["surface_audience"] == "public"]
+    nav_admin = [{"label": p["title"], "href": href(p)} for p in pages if p["surface_audience"] != "public"]
+    return pages, app_name, nav_public, nav_admin
+
+
+def _prompt_product(page: dict, app_name: str, one_liner: str,
+                    nav_public: list[dict], nav_admin: list[dict]) -> str:
+    """Prompt for a product SCREEN — framed as a user task with its persona, surface, actions and the
+    product navigation, so the model builds a designed page (public storefront vs owner admin), not a
+    CRUD dump. Domain conveyed only by the requirements + purpose; the app kind is never named."""
+    reqlist = "\n".join(f"- {r['text']}" for r in page["reqs"]) or "- (support the actions below)"
+    eplist = "\n".join(f"- POST {e['path']}"
+                       + (f"?{'&'.join(k + '=<v>' for k in e['params'])}" if e['params'] else "")
+                       + f"   (returns {e['returns']})" for e in page["eps"]) or "- (no backend calls)"
+    pub = " · ".join(f'{l["label"]} → {l["href"]}' for l in nav_public) or "Home → /"
+    adm = " · ".join(f'{l["label"]} → {l["href"]}' for l in nav_admin) or "(none)"
+    admin_home = nav_admin[0]["href"] if nav_admin else "/"   # the REAL admin landing page path
+    is_public = page["surface_audience"] == "public"
+    login_note = (" This action requires the visitor to sign in first — provide a sign-in step (a simple "
+                  "email/Google-style prompt) before the action completes." if page.get("requires_login") else "")
+    if is_public:
+        surface = ("This is a page in the PUBLIC customer-facing site. Design it as a polished public "
+                   "storefront: a clear header with the site navigation, a welcoming layout, and the "
+                   f"primary action made prominent. Show a top navigation bar with the PUBLIC links: {pub}. "
+                   f"Include a discreet owner/admin link that points EXACTLY to \"{admin_home}\" — use that "
+                   "exact href, do NOT invent a path like \"/admin\" or \"/login\"." + login_note)
+    else:
+        surface = ("This is an AUTHENTICATED admin/owner page (the back-office). Design it as an admin "
+                   "dashboard: a persistent side or top admin navigation, and content laid out as "
+                   f"management panels/tables/forms. Show the ADMIN navigation: {adm}. Include a link back "
+                   "to the public site (/). Assume the owner is already signed in (no real auth needed).")
+    hero = ("Because this is the LANDING page, open with a short hero that states what the site offers to "
+            "its visitor and surfaces the single most important action.\n") if page["is_landing"] else ""
+    prompt = f"""You are a senior product designer and frontend engineer building the "{page['title']}"
+screen of "{app_name}" — {one_liner}. Infer visual style ONLY from the requirements and this screen's
+purpose; never assume a specific kind of business by name.
+
+SCREEN PURPOSE: {page['purpose']}
+PRIMARY USER: {page['persona']}
+THE USER MUST BE ABLE TO: {', '.join(page['actions']) or 'use the features the requirements describe'}
+
+{surface}
+{hero}
+Implement these requirements:
+{reqlist}
+
+The backend already exists and SERVES THIS PAGE. Call these REAL endpoints with fetch() using RELATIVE,
+same-origin paths (e.g. fetch("{page['eps'][0]['path'] if page['eps'] else '/service/op'}?...", {{method:"POST"}}));
+NEVER prefix a domain, host, or API base URL.
+CRITICAL — the backend serves these ONLY over HTTP POST. EVERY fetch() call, INCLUDING the data-loading
+calls you run on page load (get/list/details), MUST pass {{ method: "POST" }}. A bare fetch(url) defaults
+to GET and the server returns 404, so the page shows no data. Parameters go in the query string, no
+request body. Render whatever JSON they return, degrading gracefully when fields are absent:
+{eplist}
+
+Rules: a clean, professional, responsive layout (works on mobile); render the navigation described
+above as a real, working header/sidebar with those links. If the requirements call for switching
+languages, add a working toggle. Any modal/dialog/overlay/dropdown that starts hidden MUST be hidden
+with `display:none` (toggle it by adding/removing a class that sets display) — never leave a hidden
+overlay in the layout with only opacity/visibility, because it will cover the page and intercept clicks,
+making the real buttons unclickable. IMPORTANT: when a value must be sent to the backend as a large blob
+(e.g. an uploaded image), send it in a way that does NOT put the whole blob in the URL query string.
+Do NOT load any external script, stylesheet, CDN, font, or image, and do not use
+`integrity`/`crossorigin`. If (and only if) the requirements call for a map, embed it with a plain
+`<iframe src="https://www.openstreetmap.org/export/embed.html?...">`. Output the COMPLETE, fully-written
+HTML document — every element, all CSS, all JavaScript, no "...", no placeholder comments, no
+abbreviations. Output ONLY the HTML document — no explanation, no markdown fences."""
+    # Inject any vetted SKILL (auth / upload / LLM ...) whose triggers match THIS screen — so a capability
+    # feature is built from the real pattern, not faked (a dead "Sign in with Google", a base64-in-URL
+    # upload). Selection is by the house reranker; empty (no match / skills dir absent) is a no-op.
+    req_text = " ".join([r.get("text", "") for r in page["reqs"]]
+                        + [page.get("purpose", "")] + (page.get("actions") or []))
+    try:
+        prompt += skills.skills_prompt(skills.select_skills(req_text, "frontend"))
+    except Exception:  # noqa: BLE001 — skills are best-effort; never break generation
+        pass
+    return prompt
+
+
+def _fetch_paths(html: str) -> list[str]:
+    """Extract the same-origin path from every `fetch("/...")` in the page — a plain lexical scan (no
+    regex): find each `fetch(`, read the following quoted/backtick literal, keep the path before any
+    `?`/`${`/`#`. Used to catch calls to endpoints that don't exist."""
+    paths, i, n = [], 0, len(html)
+    while True:
+        j = html.find("fetch(", i)
+        if j == -1:
+            break
+        k = j + 6
+        while k < n and html[k] in " \t\n":
+            k += 1
+        if k < n and html[k] in "\"'`":
+            q = html[k]
+            k += 1
+            start = k
+            while k < n and html[k] != q:
+                k += 1
+            lit = html[start:k]
+            for stop in ("?", "${", "#", "`"):
+                p = lit.find(stop)
+                if p != -1:
+                    lit = lit[:p]
+            if lit.startswith("/"):
+                paths.append(lit)
+        i = j + 6
+    return paths
+
+
+_INFRA_PREFIX = ("/uploads", "/static", "/health", "/metrics", "/logs", "/operation", "/docs", "/openapi")
+_ASSET_EXT = (".html", ".css", ".js", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".gif", ".webp",
+              ".json", ".woff", ".woff2", ".map")
+
+
+def _invented_endpoints(html: str, real_paths: set, api_groups: set | None = None) -> list[str]:
+    """Same-origin paths the page fetches that are NOT a real backend endpoint, NOT a page/asset, and NOT
+    a known infra path — i.e. the model invented them (e.g. /menu_management/get_counts, an entirely made-
+    up group). These 404/405 at runtime. External URLs never appear (they don't start with '/')."""
+    invented = []
+    for p in _fetch_paths(html):
+        if p in real_paths or p == "/" or p.startswith("#"):
+            continue
+        if p.startswith(_INFRA_PREFIX) or p.lower().endswith(_ASSET_EXT):
+            continue
+        invented.append(p)
+    return sorted(set(invented))
+
+
 def generate(workspace: str, handover: dict, requirements: list[dict], log=print,
              validate=None, max_attempts: int = 3) -> dict:
     """Generate the frontend from the UI requirements + the backend's real endpoints — pages DERIVED
@@ -256,28 +454,73 @@ def generate(workspace: str, handover: dict, requirements: list[dict], log=print
     Returns {pages, generated (clean), broken (failed the gate), fallback}."""
     fe_dir = os.path.join(workspace, "frontend")
     os.makedirs(fe_dir, exist_ok=True)
-    pages, app_name = _derive_pages(handover, requirements)
-    log(f"frontend: derived {len(pages)} page(s) from aspects: {[p['title'] for p in pages]}")
+    # PRODUCT-DRIVEN when the Product Agent has run: pages come from the screen map (user tasks, public
+    # vs admin, a real landing), so the app is a product — not an index of the internal modules.
+    spec = _load_product_spec(workspace)
+    product_mode = bool(spec)
+    if product_mode:
+        pages, app_name, nav_public, nav_admin = _derive_pages_from_spec(spec, handover, requirements)
+        one_liner = spec.get("one_liner", "")
+        # clear stale pages from a prior (aspect-based) build so orphaned module pages aren't served
+        keep = {f"{p['slug']}.html" for p in pages} | {"_val.html"}
+        for old in glob.glob(os.path.join(fe_dir, "*.html")):
+            if os.path.basename(old) not in keep:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        log(f"frontend: PRODUCT-driven — {len(pages)} screen(s): {[p['title'] for p in pages]} "
+            f"({len(nav_public)} public + {len(nav_admin)} admin); landing={spec.get('landing_screen')}")
+    else:
+        pages, app_name = _derive_pages(handover, requirements)
+        nav_public = nav_admin = None
+        one_liner = ""
+        log(f"frontend: derived {len(pages)} page(s) from aspects: {[p['title'] for p in pages]}")
+
+    # A hung/runaway generation trickles tokens forever, so urllib's socket timeout never fires and one
+    # page can block the whole build. Guard every page with a WALL-CLOCK deadline; on expiry, abandon the
+    # attempt (the leaked worker is harmless) and fall back to a working template.
+    page_deadline = float(os.environ.get("FRONTEND_PAGE_TIMEOUT", "200"))
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    # the REAL backend endpoints — a page must only fetch these (guards against invented paths -> 405)
+    real_paths = {e["path"] for e in _endpoints_from_contract(handover.get("code_contract") or {})}
+    api_groups = {p.strip("/").split("/")[0] for p in real_paths}
 
     built, generated, fallback, broken = [], 0, 0, 0
     for pg in pages:
         slug, title, page_reqs, page_eps = pg["slug"], pg["title"], pg["reqs"], pg["eps"]
-        prompt = _prompt(title, app_name, page_reqs, page_eps)
-        html, clean = None, False
+        base_prompt = (_prompt_product(pg, app_name, one_liner, nav_public, nav_admin) if product_mode
+                       else _prompt(title, app_name, page_reqs, page_eps))
+        html, clean, correction = None, False, ""
         for attempt in range(max_attempts):
             try:
-                cand = _call_model(prompt, log)
-            except Exception as ex:
-                log(f"  [frontend] {slug}: model error ({type(ex).__name__})")
+                cand = ex.submit(_call_model, base_prompt + correction, log).result(timeout=page_deadline)
+            except concurrent.futures.TimeoutError:
+                log(f"  [frontend] {slug}: model call exceeded {page_deadline:.0f}s — abandoning, using fallback")
+                break
+            except Exception as ex_:
+                log(f"  [frontend] {slug}: model error ({type(ex_).__name__})")
                 break
             if not _valid(cand):
                 continue
             html = cand                                  # structurally valid; keep as best-so-far
+            invented = _invented_endpoints(cand, real_paths, api_groups)
+            if invented and attempt < max_attempts - 1:
+                correction = ("\n\nCORRECTION — you called endpoints that DO NOT EXIST and will 404/405: "
+                              + ", ".join(invented[:6]) + ". Call ONLY these real endpoints (HTTP POST, "
+                              "params in the query string): " + ", ".join(sorted(real_paths)[:50])
+                              + ". Remove the invented calls (or replace with a real endpoint above); if "
+                              "no endpoint provides some data, render an empty state instead of inventing one.")
+                log(f"  [frontend] {slug}: invented endpoints {invented[:4]} — retry")
+                continue
             errs = validate(slug, cand) if validate else []
+            if invented:
+                errs = list(errs) + [f"invented endpoints: {invented[:4]}"]
             if not errs:
                 clean = True
                 break
-            log(f"  [frontend] {slug}: attempt {attempt + 1} rejected — JS errors: {errs[:2]}")
+            log(f"  [frontend] {slug}: attempt {attempt + 1} rejected — {errs[:2]}")
         if html is None:
             html = _fallback(title, page_reqs, page_eps); fallback += 1
         elif clean or validate is None:
@@ -289,15 +532,69 @@ def generate(workspace: str, handover: dict, requirements: list[dict], log=print
         built.append({"page": slug, "title": title, "reqs": [r["req_id"] for r in page_reqs]})
         log(f"  [frontend] {slug}.html <- {len(page_reqs)} req(s), {len(page_eps)} endpoint(s)")
 
-    # deterministic Home linking every derived page — generic, always works, no domain assumptions
-    links = "".join(f'<li><a href="/{b["page"]}.html">{b["title"]}</a></li>' for b in built) \
-        or "<li>No user-facing pages were derived from the requirements.</li>"
-    home = (f"<!doctype html><html lang=en><head><meta charset=utf-8>"
-            f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<title>{app_name}</title><style>body{{font-family:system-ui;margin:2rem;max-width:760px}}"
-            f"a{{color:#2563eb;text-decoration:none}}li{{margin:.4rem 0}}</style></head>"
-            f"<body><h1>{app_name}</h1><p>Sections:</p><ul>{links}</ul></body></html>")
-    with open(os.path.join(fe_dir, "index.html"), "w", encoding="utf-8") as f:
-        f.write(home)
-    log(f"frontend: {generated} clean + {broken} broken + {fallback} fallback page(s) + Home")
-    return {"pages": built, "generated": generated, "broken": broken, "fallback": fallback}
+    ex.shutdown(wait=False)                               # release idle workers (a hung one is abandoned)
+
+    if product_mode and any(b["page"] == "index" for b in built):
+        # the product's LANDING screen was generated as index.html — a real homepage, not a module index
+        log(f"frontend: PRODUCT app — {generated} clean + {broken} broken + {fallback} fallback page(s); "
+            f"home = landing screen")
+    else:
+        # fallback (no product spec, or no landing): a generic Home linking every derived page
+        links = "".join(f'<li><a href="/{b["page"]}.html">{b["title"]}</a></li>' for b in built) \
+            or "<li>No user-facing pages were derived from the requirements.</li>"
+        home = (f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+                f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+                f"<title>{app_name}</title><style>body{{font-family:system-ui;margin:2rem;max-width:760px}}"
+                f"a{{color:#2563eb;text-decoration:none}}li{{margin:.4rem 0}}</style></head>"
+                f"<body><h1>{app_name}</h1><p>Sections:</p><ul>{links}</ul></body></html>")
+        with open(os.path.join(fe_dir, "index.html"), "w", encoding="utf-8") as f:
+            f.write(home)
+        log(f"frontend: {generated} clean + {broken} broken + {fallback} fallback page(s) + Home")
+    return {"pages": built, "generated": generated, "broken": broken, "fallback": fallback,
+            "product_mode": product_mode}
+
+
+def regenerate_page(workspace: str, handover: dict, requirements: list[dict], slug: str,
+                    report: str = "", log=print) -> dict:
+    """Regenerate ONE flagged page (the Testing->Development frontend loop). Rebuilds the page from its
+    product screen with skills injected + the invented-endpoint guardrail + the tester's failure report as
+    an explicit correction, so a dead button / dead link / invented endpoint / non-completing flow is
+    fixed. Returns {slug, regenerated}. Independent-harness sanctioned: consumes the tester's findings."""
+    fe_dir = os.path.join(workspace, "frontend")
+    spec = _load_product_spec(workspace)
+    if not spec:
+        return {"slug": slug, "regenerated": False, "reason": "no product spec"}
+    pages, app_name, nav_public, nav_admin = _derive_pages_from_spec(spec, handover, requirements)
+    pg = next((p for p in pages if p["slug"] == slug or f"{p['slug']}.html" == slug), None)
+    if pg is None:
+        return {"slug": slug, "regenerated": False, "reason": "no matching screen"}
+    real_paths = {e["path"] for e in _endpoints_from_contract(handover.get("code_contract") or {})}
+    api_groups = {p.strip("/").split("/")[0] for p in real_paths}
+    correction = ("\n\nTHIS PAGE FAILED functional testing — FIX IT. Tester report:\n" + report[:1200]
+                  + "\n\nEvery button/link/control MUST actually work (perform its action, call a REAL "
+                  "endpoint, advance the UI) — no dead no-op, no placeholder alert, no invented endpoint.")
+    base_prompt = _prompt_product(pg, app_name, spec.get("one_liner", ""), nav_public, nav_admin) + correction
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    deadline = float(os.environ.get("FRONTEND_PAGE_TIMEOUT", "200"))
+    html, extra = None, ""
+    for attempt in range(3):
+        try:
+            cand = ex.submit(_call_model, base_prompt + extra, log).result(timeout=deadline)
+        except Exception:  # noqa: BLE001
+            break
+        if not _valid(cand):
+            continue
+        html = cand
+        invented = _invented_endpoints(cand, real_paths, api_groups)
+        if invented and attempt < 2:
+            extra = ("\n\nCORRECTION — these endpoints DO NOT EXIST: " + ", ".join(invented[:6])
+                     + ". Call ONLY: " + ", ".join(sorted(real_paths)[:50]))
+            continue
+        break
+    ex.shutdown(wait=False)
+    if html is None:
+        return {"slug": slug, "regenerated": False, "reason": "generation failed"}
+    with open(os.path.join(fe_dir, f"{pg['slug']}.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+    log(f"regenerated {pg['slug']}.html from tester report")
+    return {"slug": pg["slug"], "regenerated": True}

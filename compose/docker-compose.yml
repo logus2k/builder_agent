@@ -23,11 +23,16 @@ services:
       BUILDER_DATA_DIR: "/app/data"
       # opencode resolves ~/.opencode/bin/opencode and ~/.config/opencode/opencode.json under HOME.
       HOME: "/home/app"
+      # Vetted capability SKILLs (auth/upload/LLM ...) injected into generation; reranker selects them.
+      SKILLS_DIR: "/app/skills"
+      EMBEDDINGS_URL: "http://localhost:8601"
     volumes:
       # build reports are the agent's own; survive rebuilds
       - ../data:/app/data
       # the per-project git repos (reqoach owns git); the Builder writes code/ here, reqoach commits
       - /home/logus/env/project-repos:/app/project-repos
+      # vetted capability skills (opencode/Claude-compatible SKILL.md), read-only
+      - /home/logus/.claude/skills:/app/skills:ro
       # the host opencode binary + its model config (carries the temperature=0 build setting), read-only
       - /home/logus/.opencode:/home/app/.opencode:ro
       - /home/logus/.config/opencode:/home/app/.config/opencode:ro
