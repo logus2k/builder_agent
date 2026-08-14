@@ -16,7 +16,7 @@ import os
 import urllib.request
 
 from . import (assemble, context, contract_scaffold, frontend, frontend_gate, heal, opencode, release,
-               repair, structure, verify)
+               repair, repo_seam, structure, verify)
 
 _SKIP_DIRS = {"__pycache__", ".venv_build", ".venv", ".git", ".opencode", "node_modules"}
 
@@ -52,7 +52,7 @@ def _normalize_collisions(groups: dict, log=print) -> dict:
     return fixed
 
 
-def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=print) -> dict:
+def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=print, auth: bool = False) -> dict:
     """Guarantee the acceptance-green STRUCTURE regardless of what the model produced. The model
     reliably degrades scaffolds (drops exports, un-mounts routers, injects an ORM, imports files it
     never created); rather than chase that, we re-assert the deterministic contract structure as the
@@ -67,10 +67,13 @@ def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=p
     proven-green scaffold — keeping the model's bodies only where they survived intact."""
     import ast
     persist = contract_scaffold.scaffold_persistence(workspace, log=log)  # (0) real data-access seam
-    contract_scaffold.scaffold_api(workspace, contract, log=log)          # (1) routers + main
+    sec = contract_scaffold.scaffold_security(workspace, log=log) if auth else None  # auth seam (env-provided)
+    contract_scaffold.scaffold_api(workspace, contract, log=log, auth=auth)  # (1) routers + main (+whoami)
     paths = contract_scaffold.module_paths(contract)
     keep = set(paths.values()) | {f"app/api/{k}.py" for k, v in contract.items()
                                   if v.get("kind") == "service"} | {"main.py", persist}
+    if sec:
+        keep.add(sec)
 
     # RESPECT PLANNER TASKS: don't blanket-prune every non-contract file — a plan task that produced a
     # real module wired INTO the app (imported, transitively, from a kept file) should survive. Walk
@@ -170,7 +173,7 @@ def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=p
             contract_scaffold.scaffold(workspace, {k: contract[k]}, log=lambda m: None)
             rescaffolded += 1
         bad = set()
-    contract_scaffold.scaffold_api(workspace, contract, log=lambda m: None)   # routers depend on services
+    contract_scaffold.scaffold_api(workspace, contract, log=lambda m: None, auth=auth)  # re-assert routers+main (keep whoami)
     # (4) clean, ORM-free manifest.
     mani = skeleton.get("manifest") or "requirements.txt"
     deps = ["fastapi", "pydantic", "pydantic-settings", "python-multipart", "starlette", "uvicorn"]
@@ -590,12 +593,20 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     # construction (verified: collisions impossible, imports/exports line up) — and register them so
     # the tasks realizing each concept FILL the scaffold instead of inventing a rival file.
     contract = (handover or {}).get("code_contract") or {}
+    # AUTH is an ENVIRONMENT capability: when the Architect stripped app-auth it records an obligation
+    # in environment_capabilities. That flag drives the deterministic auth seam (app/security.py +
+    # /whoami reading X-Auth-Request-Email) — no OAuth code, held regardless of model output.
+    auth_required = any((c or {}).get("capability") == "authentication"
+                        for c in ((handover or {}).get("environment_capabilities") or []))
     if contract:
+        contract_scaffold.normalize_crud_ids(contract, log=log)             # update/delete ops must take an id
         contract_scaffold.scaffold_persistence(workspace, log=log)          # real data-access seam
+        if auth_required:
+            contract_scaffold.scaffold_security(workspace, log=log)         # auth seam (env-provided)
         # PLACEHOLDER bodies so opencode SEES each operation needs real logic and implements it (a
         # working stub reads as 'already done' and gets skipped). finalize backfills any it leaves.
         scaf = contract_scaffold.scaffold(workspace, contract, log=log, bodies="placeholder")
-        api = contract_scaffold.scaffold_api(workspace, contract, log=log)   # routers + entrypoint
+        api = contract_scaffold.scaffold_api(workspace, contract, log=log, auth=auth_required)  # routers + entrypoint
         _seed_contract_modules(cmap, contract, log)
         log(f"contract: scaffolded {scaf['modules']} modules + {api['routers']} routers + main "
             f"(full structure coherent by construction) from {len(contract)} concepts")
@@ -723,7 +734,15 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
     # deterministic contract structure as the last step and drop the drift — guaranteeing a coherent,
     # booting, route-complete, ORM-free app regardless of what the model did. Model bodies survive
     # only where they stayed intact (parse + keep exports + no ORM + imports resolve post-prune).
-    finalize = _finalize_contract_app(workspace, contract, skeleton, log) if contract else None
+    finalize = _finalize_contract_app(workspace, contract, skeleton, log, auth=auth_required) if contract else None
+
+    # DETERMINISTIC PERSISTENCE-SEAM REPAIR: model-filled custom bodies call `repo.get(...)` on the bare
+    # factory function (-> AttributeError 500). Bind each to a concrete store per the contract. Runs on the
+    # surviving model bodies (finalize already re-scaffolded the broken ones, which are clean by construction).
+    if contract:
+        seam = repo_seam.repair(workspace, contract, log=log)
+        if isinstance(finalize, dict):
+            finalize["repo_seam"] = seam
 
     # FRONTEND STAGE — after the backend, build the UI from the frontend requirements + the real
     # endpoints the backend now exposes (derived from the contract). Real pages (menu/admin/

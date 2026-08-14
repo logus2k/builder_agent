@@ -71,8 +71,13 @@ class Repo:
     def get(self, ident):
         return self._items.get(self._key(ident))
 
-    def list(self):
-        return list(self._items.values())
+    def list(self, **filters):
+        items = list(self._items.values())
+        # optional equality filters (repo("x").list(type="asset")): model bodies routinely pass filter
+        # kwargs expecting server-side filtering; support it so those calls work instead of raising.
+        if filters:
+            items = [r for r in items if all(r.get(k) == v for k, v in filters.items())]
+        return items
 
     def update(self, ident, data=None):
         k = self._key(ident)
@@ -115,6 +120,34 @@ def _verb(op_name: str) -> str | None:
         if head in verbs:
             return kind
     return None
+
+
+def _has_id_input(inputs: list) -> bool:
+    """True if an operation already takes an identifier (a param named `id` or ending in `_id`)."""
+    for p in inputs or []:
+        n = (p.get("name") or "").lower()
+        if n == "id" or n.endswith("_id"):
+            return True
+    return False
+
+
+def normalize_crud_ids(contract: dict, log=print) -> int:
+    """DETERMINISTIC contract normalization: an UPDATE or DELETE operation must take an identifier to
+    locate the record. When the design omitted one (e.g. `update_menu(menu)`), prepend an `id` input so
+    the generated endpoint ACCEPTS an id and the CRUD body updates/deletes BY id — otherwise the body
+    falls back to using the payload as the key and update/delete-by-id silently returns None. Mutates the
+    contract in place (so both the endpoint scaffold and the body scaffold see the id). Returns the count."""
+    added = 0
+    for v in contract.values():
+        for e in v.get("exports", []):
+            if e.get("kind") != "function":
+                continue
+            if _verb(e.get("symbol", "")) in ("update", "delete") and not _has_id_input(e.get("inputs")):
+                e.setdefault("inputs", []).insert(0, {"name": "id", "type": "int"})
+                added += 1
+    if added:
+        log(f"  [contract-norm] added an id input to {added} update/delete op(s) that lacked one")
+    return added
 
 
 def _bare_type(t) -> str:
@@ -260,6 +293,49 @@ def scaffold_persistence(workspace: str, log=print) -> str:
     return rel
 
 
+# ---- authentication seam (environment-provided) -------------------------------------------------
+# When the Architect records an `environment_capabilities` auth obligation, authentication is provided
+# by the shared oauth2-proxy (it performs the Google sign-in and injects X-Auth-Request-Email). The app
+# implements NO OAuth; it only READS that header. We scaffold that read deterministically so the
+# invariant holds regardless of model output — the same reasoning as the CRUD seam above.
+_SECURITY_PY = '''"""Authentication seam — identity comes from the ENVIRONMENT, not this app.
+
+A shared oauth2-proxy fronts the domain: it performs the Google sign-in and injects the authenticated
+user's email as the `X-Auth-Request-Email` request header. This app implements NO OAuth, sessions, or
+tokens — it TRUSTS that proxy-injected header as the identity. The deploy stage registers the app behind
+oauth2-proxy (see nginx_register_app); locally (no proxy) the header is absent and the user is anonymous.
+"""
+from fastapi import HTTPException, Request
+
+AUTH_HEADER = "x-auth-request-email"
+
+
+def get_authenticated_user(request: Request):
+    """Return the signed-in user's email (proxy-injected), or None when unauthenticated / local-dev.
+    Never trust a client-supplied email — only this proxy-injected header is authoritative."""
+    return request.headers.get(AUTH_HEADER)
+
+
+def require_user(request: Request) -> str:
+    """Same as get_authenticated_user, but 401 when absent — use to gate a protected endpoint."""
+    email = get_authenticated_user(request)
+    if not email:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return email
+'''
+
+
+def scaffold_security(workspace: str, log=print) -> str:
+    """Write the deterministic authentication seam (app/security.py). Returns its module path."""
+    os.makedirs(os.path.join(workspace, "app"), exist_ok=True)
+    open(os.path.join(workspace, "app", "__init__.py"), "a", encoding="utf-8").close()
+    rel = "app/security.py"
+    with open(os.path.join(workspace, rel), "w", encoding="utf-8") as f:
+        f.write(_SECURITY_PY)
+    log(f"  [scaffold] {rel} (auth seam — reads X-Auth-Request-Email; app implements no OAuth)")
+    return rel
+
+
 def scaffold(workspace: str, contract: dict, log=print, bodies: str = "working") -> dict:
     """Write a skeleton module for every contract concept. Returns what was written.
 
@@ -352,7 +428,7 @@ def scaffold(workspace: str, contract: dict, log=print, bodies: str = "working")
     return {"modules": len(written), "paths": written}
 
 
-def scaffold_api(workspace: str, contract: dict, log=print) -> dict:
+def scaffold_api(workspace: str, contract: dict, log=print, auth: bool = False) -> dict:
     """Extend the scaffold to the DELIVERY layer so the WHOLE structure is coherent by construction,
     not just models/services: for each service, a router module that imports the service functions by
     their exact contract names and exposes an endpoint per operation; and the entrypoint (main.py)
@@ -382,10 +458,17 @@ def scaffold_api(workspace: str, contract: dict, log=print) -> dict:
         lines += ["", f'router = APIRouter(prefix="/{key}", tags=["{key}"])', ""]
         for e in ops:
             op = e["symbol"]
-            params = ", ".join(p["name"] for p in e.get("inputs", []) if p.get("name"))
+            names = [p["name"] for p in e.get("inputs", []) if p.get("name")]
+            # READ operations (get/list) load data on page open; a missing or mis-named query param must
+            # DEGRADE GRACEFULLY (return empty) rather than hard-fail with 422 and blank the page. So their
+            # endpoint params are OPTIONAL (=None). WRITE operations keep required params (you cannot create
+            # without data). Deterministic, project-agnostic — keyed on the CRUD verb, not any field name.
+            is_read = _verb(op) in ("get", "list")
+            sig = ", ".join(n + ("=None" if is_read else "") for n in names)
+            call = ", ".join(names)
             lines.append(f'@router.post("/{op}")')
-            lines.append(f"def {op}_endpoint({params}):")
-            lines.append(f"    return {op}({params})")
+            lines.append(f"def {op}_endpoint({sig}):")
+            lines.append(f"    return {op}({call})")
             lines.append("")
         with open(os.path.join(workspace, rel), "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -397,11 +480,24 @@ def scaffold_api(workspace: str, contract: dict, log=print) -> dict:
     # (added first) still win and the pages are served for everything else.
     m = ['"""Application entrypoint — generated from the code contract."""',
          "import os", "from fastapi import FastAPI", "from fastapi.staticfiles import StaticFiles"]
+    if auth:
+        m.append("from fastapi import Request")
+        m.append("from app.security import get_authenticated_user")
     for key in routers:
         m.append(f"from app.api.{key} import router as {key}_router")
     m += ["", "app = FastAPI()"]
     for key in routers:
         m.append(f"app.include_router({key}_router)")
+    # AUTH SEAM (environment-provided): expose who the oauth2-proxy signed in. The app implements no
+    # OAuth — this only READS the proxy-injected X-Auth-Request-Email header. Reachable by construction.
+    if auth:
+        # accept BOTH GET and POST: generated frontends call it either way (the google-auth skill's
+        # sign-in check POSTs), and a method mismatch is a 405 dead-end, not an auth decision.
+        m += ["",
+              "@app.api_route(\"/whoami\", methods=[\"GET\", \"POST\"])",
+              "def whoami(request: Request):",
+              "    email = get_authenticated_user(request)",
+              "    return {\"authenticated\": bool(email), \"email\": email}"]
     m += ["",
           '_FE = os.path.join(os.path.dirname(__file__), "frontend")',
           "if os.path.isdir(_FE):",

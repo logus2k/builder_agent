@@ -291,6 +291,19 @@ def _derive_pages_from_spec(spec: dict, handover: dict, requirements: list[dict]
     landing = spec.get("landing_screen")
     screens = spec.get("screens") or []
 
+    # AUTH is ENVIRONMENT-provided (oauth2-proxy): a screen whose SOLE purpose is signing in (EVERY action
+    # is a sign-in/authenticate action) is infrastructure the app must NOT build — the Product agent
+    # sometimes emits a "Google Login" screen, which the frontend would render as a dead /login the tester
+    # walks into and stalls. Drop those screens; sign-in is triggered by navigating to the gated route (see
+    # the per-page login note). Deterministic: a CLOSED auth-verb vocabulary (same approach as the
+    # Architect's capabilities.is_auth_operation), applied to the screen's actions — never a semantic guess.
+    _AUTH_ACT_TOKENS = ("sign in", "sign-in", "signin", "log in", "log-in", "login", "authenticate",
+                        "authentication", "oauth", "sign up", "sign-up", "signup", "sso")
+    def _is_auth_only(s):
+        acts = [a for a in (s.get("key_actions") or []) if a and a.strip()]
+        return bool(acts) and all(any(t in a.lower() for t in _AUTH_ACT_TOKENS) for a in acts)
+    screens = [s for s in screens if not _is_auth_only(s)]
+
     def _is_public(s):
         return surf_aud.get(s.get("surface"), s.get("audience", "public")) == "public"
 
@@ -332,8 +345,17 @@ def _prompt_product(page: dict, app_name: str, one_liner: str,
     adm = " · ".join(f'{l["label"]} → {l["href"]}' for l in nav_admin) or "(none)"
     admin_home = nav_admin[0]["href"] if nav_admin else "/"   # the REAL admin landing page path
     is_public = page["surface_audience"] == "public"
-    login_note = (" This action requires the visitor to sign in first — provide a sign-in step (a simple "
-                  "email/Google-style prompt) before the action completes." if page.get("requires_login") else "")
+    # Auth is ENVIRONMENT-provided (a shared oauth2-proxy). A sign-in required action must NOT build its own
+    # login form/page — that both duplicates infra the app doesn't own and creates a dead /login the tester
+    # walks into. Instead gate via the proxy sign-in + /whoami. This mirrors the google-auth skill.
+    login_note = (" This action is for a SIGNED-IN user, but authentication is provided by the ENVIRONMENT "
+                  "(a shared sign-in proxy) — do NOT build a login form, a password/email field, a 'Sign in "
+                  "with Google' prompt, or a separate login page. To gate the action: on load call "
+                  "fetch('/whoami', {method:'POST'}).then(r=>r.json()) -> {authenticated, email}; if the user "
+                  "is NOT authenticated, send the browser to '/oauth2/sign_in?rd=' + "
+                  "encodeURIComponent(location.pathname) (this runs the sign-in and returns to this page); "
+                  "once authenticated, proceed with the action and show who is signed in."
+                  if page.get("requires_login") else "")
     if is_public:
         surface = ("This is a page in the PUBLIC customer-facing site. Design it as a polished public "
                    "storefront: a clear header with the site navigation, a welcoming layout, and the "
