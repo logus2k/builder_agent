@@ -82,13 +82,23 @@ def repair(workspace: str, contract: dict, log=print) -> dict:
             cands = [key] + cands
         cands = [c for c in cands if c in entity_keys]    # only real stores
         if not cands:
-            continue
+            # CRASH-STOP, never skip. A bare `repo.<crud>(` is ALWAYS a runtime 500 (repo is a factory),
+            # independent of whether the contract lets us name the right entity. A service with no entity
+            # dependency (e.g. a compliance/validation service that looks records up by an external key)
+            # would otherwise keep the crash. Bind such calls to the concept's OWN store: a valid, empty
+            # store whose get()/list() return None/[] so the model's existing not-found branches produce a
+            # graceful 200 instead of a 500. The exact store, if it should be a real entity, is left to the
+            # tester->builder fix-loop, which has the runtime error context. Deterministic, no guessing.
+            cands = [key]
         # entity concepts live under models/, services under services/ (mirror contract_scaffold._path_of)
         subdir = "models" if v.get("kind") == "entity" else "services"
         path = os.path.join(workspace, "app", subdir, f"{key}.py")
         if not os.path.isfile(path):
             continue
         f, a = repair_module(path, cands, cands[0], log)
+        # Second seam defect, same module: the store returns DICTS, so `record.id`
+        # on a CRUD result is always a runtime AttributeError. Repair it here too.
+        f += repair_record_attrs(path, log)
         if f:
             total += f
             ambiguous += a
@@ -97,3 +107,126 @@ def repair(workspace: str, contract: dict, log=print) -> dict:
         log(f"repo-seam repair: bound {total} misuse site(s) across {modules} module(s) "
             f"({ambiguous} ambiguous deferred to the fix-loop)")
     return {"sites": total, "ambiguous": ambiguous, "modules": modules}
+
+
+# --------------------------------------------------------------------------- #
+# Store results are DICTS, not ORM objects                                      #
+# --------------------------------------------------------------------------- #
+# Repo.create/get/update/list return plain dicts (see the persistence template).
+# Model-written bodies routinely treat the result as an ORM row and read
+# `record.id`, which raises at runtime `AttributeError: 'dict' object has no
+# attribute 'id'` (HTTP 500). Same shape as the bare-`repo.get(` defect above:
+# systemic, deterministically detectable, not something to hope a prompt
+# prevents. Detected via the AST and repaired with a position-precise edit —
+# no regex — so comments and formatting survive.
+
+#: attributes that are REAL on a dict; never rewrite these
+_DICT_ATTRS = {
+    "get", "keys", "values", "items", "copy", "pop", "popitem", "setdefault",
+    "update", "clear", "fromkeys",
+}
+
+
+def _store_bound_names(tree: "ast.AST") -> set:
+    """Names bound to the result of a store CRUD call, in either form the models
+    write: `x = repo("y").create(...)` and `r = repo("y")` then `x = r.create(...)`."""
+    handles, bound = set(), set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        # r = repo("y")
+        if isinstance(func, ast.Name) and func.id == "repo":
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    handles.add(t.id)
+            continue
+        if not isinstance(func, ast.Attribute) or func.attr not in _CRUD:
+            continue
+        base = func.value
+        is_store = (
+            (isinstance(base, ast.Call) and isinstance(base.func, ast.Name) and base.func.id == "repo")
+            or (isinstance(base, ast.Name) and base.id in handles)
+        )
+        if is_store:
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    bound.add(t.id)
+    return bound
+
+
+def repair_record_attrs(path: str, log) -> int:
+    """Rewrite `record.field` -> `record["field"]` for every name bound from a
+    store CRUD call. Returns the number of sites fixed."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        return 0
+
+    bound = _store_bound_names(tree)
+    if not bound:
+        return 0
+
+    called = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            called.add(id(node.func))
+
+    edits, hasattr_edits = [], []
+    # `hasattr(record, "x")` on a dict is ALWAYS False, so the guarded branch never
+    # runs and the field silently reads as absent — worse than a crash, because the
+    # endpoint returns 200 with quietly wrong data. Rewrite to a membership test.
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "hasattr" and len(node.args) == 2
+                and isinstance(node.args[0], ast.Name) and node.args[0].id in bound
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)):
+            hasattr_edits.append(node)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+            continue
+        if node.value.id not in bound or node.attr in _DICT_ATTRS:
+            continue
+        if id(node) in called:
+            continue          # a CALL on a non-dict attribute is a different bug
+        if not isinstance(node.ctx, ast.Load):
+            continue          # only reads; an assignment target needs a real fix
+        edits.append(node)
+
+    if not edits and not hasattr_edits:
+        return 0
+
+    lines = src.splitlines(keepends=True)
+    offsets, total = [], 0
+    for line in lines:
+        offsets.append(total)
+        total += len(line)
+
+    def pos(lineno, col):
+        return offsets[lineno - 1] + col
+
+    # apply back-to-front so earlier offsets stay valid
+    replacements = [
+        (n.value.lineno, n.value.col_offset, n.end_lineno, n.end_col_offset,
+         f'{n.value.id}["{n.attr}"]') for n in edits
+    ] + [
+        (n.lineno, n.col_offset, n.end_lineno, n.end_col_offset,
+         f'"{n.args[1].value}" in {n.args[0].id}') for n in hasattr_edits
+    ]
+    out = src
+    for lineno, col, end_lineno, end_col, text in sorted(replacements, reverse=True):
+        out = out[:pos(lineno, col)] + text + out[pos(end_lineno, end_col):]
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(out)
+    parts = []
+    if edits:
+        parts.append(f"{len(edits)} attribute access(es) -> dict access")
+    if hasattr_edits:
+        parts.append(f"{len(hasattr_edits)} always-False hasattr() -> membership test")
+    log(f"  [repo-seam] {os.path.basename(path)}: " + "; ".join(parts))
+    return len(edits) + len(hasattr_edits)

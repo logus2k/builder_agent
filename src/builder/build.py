@@ -66,7 +66,7 @@ def _finalize_contract_app(workspace: str, contract: dict, skeleton: dict, log=p
     Result: models + services + routers + main are coherent, import-clean, ORM-free, and boot — the
     proven-green scaffold — keeping the model's bodies only where they survived intact."""
     import ast
-    persist = contract_scaffold.scaffold_persistence(workspace, log=log)  # (0) real data-access seam
+    persist = contract_scaffold.scaffold_persistence(workspace, contract, log=log)  # (0) real data-access seam (+entities)
     sec = contract_scaffold.scaffold_security(workspace, log=log) if auth else None  # auth seam (env-provided)
     contract_scaffold.scaffold_api(workspace, contract, log=log, auth=auth)  # (1) routers + main (+whoami)
     paths = contract_scaffold.module_paths(contract)
@@ -449,6 +449,31 @@ def _module_defining(workspace: str, func: str, preferred: str | None) -> str | 
     return None
 
 
+#: HTTP methods a tester may prefix onto an endpoint it reports
+_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+
+
+def _parse_endpoint(raw: str) -> tuple[str, list[str]]:
+    """(path, [segments]) from whatever form the tester reported an endpoint in.
+
+    A finding routinely arrives as "POST /group/op" or "/group/op?x=1", and taking
+    the first slash-separated token blindly makes the METHOD the group and the
+    group the operation — the fix loop then reports "no module defines <group>"
+    and silently skips every failure it was handed. Lexical, no regex.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "", []
+    tokens = text.split()
+    if len(tokens) > 1 and tokens[0].upper().rstrip(":") in _HTTP_METHODS:
+        text = tokens[-1]
+    else:
+        text = tokens[-1] if len(tokens) == 1 else text
+    text = text.split("?", 1)[0].split("#", 1)[0].strip()
+    segments = [seg for seg in text.split("/") if seg]
+    return text, segments
+
+
 def fix_failures(pid: str, failures: list[dict], report: str = "", log=print) -> dict:
     """Testing->Development feedback loop: fix each failing endpoint's function via a direct-completion
     fix (opencode.fix_module), ONE at a time, using its traceback + the tester report, then republish
@@ -460,10 +485,10 @@ def fix_failures(pid: str, failures: list[dict], report: str = "", log=print) ->
     mpaths = contract_scaffold.module_paths(contract) if contract else {}
     fixed, skipped = [], []
     for f in failures:
-        ep = (f.get("endpoint") or f.get("id") or "").strip("/")
-        parts = [p for p in ep.split("/") if p]
+        raw = (f.get("endpoint") or f.get("id") or "").strip()
+        ep, parts = _parse_endpoint(raw)
         if len(parts) < 2:
-            skipped.append({"endpoint": ep, "reason": "unmappable endpoint"}); continue
+            skipped.append({"endpoint": raw, "reason": "unmappable endpoint"}); continue
         group, op = parts[0], parts[1]
         path = _module_defining(workspace, op, mpaths.get(group))
         if not path:
@@ -489,7 +514,14 @@ def fix_page(pid: str, slug: str, report: str = "", log=print) -> dict:
     handover = load_handover(pid) or {}
     reqs_path = os.path.join(os.path.dirname(workspace.rstrip("/")), "requirements", "package.json")
     reqs = json.load(open(reqs_path)).get("requirements", []) if os.path.isfile(reqs_path) else []
-    out = frontend.regenerate_page(workspace, handover, reqs, slug, report, log=log)
+    # Same render+JS gate generate uses, so a regenerated page is rendered and JS-checked before shipping
+    # (make_validator only needs the manifest to boot the app). Without it the fix-loop can ship a page with
+    # a load-time JS error and never converge.
+    gate = frontend_gate.make_validator(workspace, {"manifest": "requirements.txt"}, log)
+    try:
+        out = frontend.regenerate_page(workspace, handover, reqs, slug, report, log=log, validate=gate)
+    finally:
+        frontend_gate.shutdown(gate)
     commit = publish_to_repo(pid, f"Builder: fix frontend page {slug} from test report") \
         if out.get("regenerated") else {}
     return {**out, "repo": commit}
@@ -600,7 +632,7 @@ def build_plan(plan: dict, workspace: str, cap: int | None = None, retries: int 
                         for c in ((handover or {}).get("environment_capabilities") or []))
     if contract:
         contract_scaffold.normalize_crud_ids(contract, log=log)             # update/delete ops must take an id
-        contract_scaffold.scaffold_persistence(workspace, log=log)          # real data-access seam
+        contract_scaffold.scaffold_persistence(workspace, contract, log=log)  # real data-access seam (+entities)
         if auth_required:
             contract_scaffold.scaffold_security(workspace, log=log)         # auth seam (env-provided)
         # PLACEHOLDER bodies so opencode SEES each operation needs real logic and implements it (a

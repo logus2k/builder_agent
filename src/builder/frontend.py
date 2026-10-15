@@ -20,7 +20,7 @@ import json
 import os
 import urllib.request
 
-from . import skills
+from . import skills, verify
 
 # The OpenAI-compatible persona server. NOT BUILDER_LLM_URL (:8500) — that is opencode's raw model
 # backend and does not speak /v1/chat/completions.
@@ -176,6 +176,23 @@ def _sanitize(html: str) -> str:
             html = html[:h] + guard + html[h:]
         else:
             html = guard + html
+    # DETERMINISTIC HTTP-METHOD INVARIANT (generic, any app): the backend serves EVERY API operation over
+    # POST, but the model routinely emits a bare fetch("/service/op?...") (or a data-load fetch) with no
+    # method, which defaults to GET and 404s — silently breaking page loads and journeys. Rather than trust
+    # the prompt, install a tiny fetch shim that defaults any SAME-ORIGIN relative-path request with no
+    # explicit method to POST. It touches nothing else: absolute URLs (CDNs/maps) and any fetch that already
+    # sets a method are passed through unchanged; assets load via <script>/<link>/<img>, not fetch. This
+    # makes the "all endpoints are POST" contract hold by construction, independent of model compliance.
+    shim = ("<script>(function(){var _f=window.fetch;window.fetch=function(u,o){o=o||{};"
+            "if(typeof u==='string'&&u.charAt(0)==='/'&&!o.method){o.method='POST';}"
+            "return _f.call(this,u,o);};})();</script>")
+    if "window.fetch=function" not in html.replace(" ", ""):
+        low = html.lower()
+        hd = low.find("<head>")
+        if hd != -1:
+            html = html[:hd + 6] + shim + html[hd + 6:]     # first thing in <head>, before any page script
+        else:
+            html = shim + html
     return html
 
 
@@ -311,18 +328,40 @@ def _derive_pages_from_spec(spec: dict, handover: dict, requirements: list[dict]
         pub = next((s for s in screens if _is_public(s)), screens[0] if screens else None)
         if pub:
             pub["is_landing"] = True
+    # EXACTLY ONE landing screen. `landing_screen` is the spec's declaration and wins;
+    # a stray per-screen `is_landing` is only consulted when the spec names no landing
+    # that exists. Without this, a spec that says landing_screen=X while ALSO marking Y
+    # is_landing gives both the slug "index" and one screen is silently overwritten —
+    # the page simply never exists, with no error anywhere.
+    landing_declared = bool(landing) and any(s.get("id") == landing for s in screens)
+
     pages = []
+    used_slugs = set()
     for s in screens:
         sid = s.get("id") or _slug(s.get("title", ""))
         sreqids = set(s.get("requirements") or [])
         reqs = [req_by_id[i] for i in sreqids if i in req_by_id]
         eps = [ep for ep in all_eps if ep_reqids[ep["path"]] & sreqids] or all_eps[:6]
-        is_landing = bool(s.get("is_landing")) or sid == landing
-        pages.append({"slug": "index" if is_landing else _slug(sid), "screen_id": sid,
+        is_landing = (sid == landing) if landing_declared else (
+            bool(s.get("is_landing")) or sid == landing)
+        slug = "index" if is_landing else _slug(sid)
+        if slug in used_slugs:
+            # Two screens resolving to one file would lose a screen silently; keep both.
+            suffix = 2
+            while f"{slug}_{suffix}" in used_slugs:
+                suffix += 1
+            slug = f"{slug}_{suffix}"
+        used_slugs.add(slug)
+        pages.append({"slug": slug, "screen_id": sid,
                       "title": s.get("title") or sid, "purpose": s.get("purpose", ""),
                       "persona": s.get("primary_persona", ""),
                       "surface_audience": "public" if _is_public(s) else "admin",
-                      "requires_login": s.get("audience") == "authenticated",
+                      # A PUBLIC-surface screen must render + act for anyone: a public action (book a table,
+                      # contact) must NOT force a client-side sign-in — otherwise an unsigned visitor gets
+                      # bounced to the proxy's /oauth2/sign_in (which 404s off-proxy) instead of using it.
+                      # Only ADMIN-surface screens are gated (and those are also gated at nginx by deploy).
+                      # Keyed on the SURFACE (an env/architecture fact), not the model's audience guess.
+                      "requires_login": not _is_public(s),
                       "actions": s.get("key_actions") or [], "reqs": reqs, "eps": eps,
                       "is_landing": is_landing})
     app_name = spec.get("product_name") or (handover.get("source_package", {}) or {}).get("project_name") or "Application"
@@ -333,7 +372,8 @@ def _derive_pages_from_spec(spec: dict, handover: dict, requirements: list[dict]
 
 
 def _prompt_product(page: dict, app_name: str, one_liner: str,
-                    nav_public: list[dict], nav_admin: list[dict]) -> str:
+                    nav_public: list[dict], nav_admin: list[dict],
+                    upload_contract: str = "") -> str:
     """Prompt for a product SCREEN — framed as a user task with its persona, surface, actions and the
     product navigation, so the model builds a designed page (public storefront vs owner admin), not a
     CRUD dump. Domain conveyed only by the requirements + purpose; the app kind is never named."""
@@ -348,20 +388,27 @@ def _prompt_product(page: dict, app_name: str, one_liner: str,
     # Auth is ENVIRONMENT-provided (a shared oauth2-proxy). A sign-in required action must NOT build its own
     # login form/page — that both duplicates infra the app doesn't own and creates a dead /login the tester
     # walks into. Instead gate via the proxy sign-in + /whoami. This mirrors the google-auth skill.
-    login_note = (" This action is for a SIGNED-IN user, but authentication is provided by the ENVIRONMENT "
+    login_note = (" This action requires a SIGNED-IN user, but authentication is provided by the ENVIRONMENT "
                   "(a shared sign-in proxy) — do NOT build a login form, a password/email field, a 'Sign in "
-                  "with Google' prompt, or a separate login page. To gate the action: on load call "
-                  "fetch('/whoami', {method:'POST'}).then(r=>r.json()) -> {authenticated, email}; if the user "
-                  "is NOT authenticated, send the browser to '/oauth2/sign_in?rd=' + "
-                  "encodeURIComponent(location.pathname) (this runs the sign-in and returns to this page); "
-                  "once authenticated, proceed with the action and show who is signed in."
+                  "with Google' prompt, or a separate login page. CRITICAL: NEVER redirect away or block the "
+                  "page on load — ALWAYS render this page and its form so any visitor immediately sees it. "
+                  "Gate ONLY the submit ACTION: inside the submit handler, first check "
+                  "fetch('/whoami', {method:'POST'}).then(r=>r.json()) -> {authenticated}; if NOT "
+                  "authenticated, THEN navigate to '/oauth2/sign_in?rd=' + encodeURIComponent(location.pathname) "
+                  "(which signs in and returns here to finish); if authenticated, submit normally. Do not call "
+                  "whoami on page load in a way that can redirect — the form must be visible without signing in."
                   if page.get("requires_login") else "")
     if is_public:
         surface = ("This is a page in the PUBLIC customer-facing site. Design it as a polished public "
                    "storefront: a clear header with the site navigation, a welcoming layout, and the "
                    f"primary action made prominent. Show a top navigation bar with the PUBLIC links: {pub}. "
                    f"Include a discreet owner/admin link that points EXACTLY to \"{admin_home}\" — use that "
-                   "exact href, do NOT invent a path like \"/admin\" or \"/login\"." + login_note)
+                   "exact href, do NOT invent a path like \"/admin\" or \"/login\"." + login_note
+                   + (" CRITICAL — this page is PUBLIC: EVERY visitor must see ALL content and be able to use "
+                      "EVERY action WITHOUT signing in. Do NOT add any login/sign-in gate: no 'Sign in with "
+                      "Google' button, no /whoami auth check that hides or disables the form, no redirect to "
+                      "sign-in, and never hide a section behind authentication. The form is always visible "
+                      "and its submit posts directly to the real endpoint." if not page.get("requires_login") else ""))
     else:
         surface = ("This is an AUTHENTICATED admin/owner page (the back-office). Design it as an admin "
                    "dashboard: a persistent side or top admin navigation, and content laid out as "
@@ -387,9 +434,11 @@ same-origin paths (e.g. fetch("{page['eps'][0]['path'] if page['eps'] else '/ser
 NEVER prefix a domain, host, or API base URL.
 CRITICAL — the backend serves these ONLY over HTTP POST. EVERY fetch() call, INCLUDING the data-loading
 calls you run on page load (get/list/details), MUST pass {{ method: "POST" }}. A bare fetch(url) defaults
-to GET and the server returns 404, so the page shows no data. Parameters go in the query string, no
-request body. Render whatever JSON they return, degrading gracefully when fields are absent:
+to GET and the server returns 404, so the page shows no data. SCALAR parameters go in the query string.
+A FILE/IMAGE payload is the ONE exception: it goes in the request BODY as multipart/form-data, never in
+the URL. Render whatever JSON they return, degrading gracefully when fields are absent:
 {eplist}
+{upload_contract}
 
 Rules: a clean, professional, responsive layout (works on mobile); render the navigation described
 above as a real, working header/sidebar with those links. If the requirements call for switching
@@ -463,6 +512,142 @@ def _invented_endpoints(html: str, real_paths: set, api_groups: set | None = Non
     return sorted(set(invented))
 
 
+#: Labels that name a primary CREATE/PURCHASE action a user takes — the click that MUST reach the backend.
+_CTA_VERBS = ("add to cart", "add to bag", "add to basket", "buy now", "buy ", "checkout", "check out",
+              "place order", "place your order", "purchase", "complete order", "complete purchase",
+              "pay now", "confirm order", "submit order")
+#: Op-name leading tokens that denote a WRITE endpoint (the backend action a CTA should POST to).
+_WRITE_OPS = ("add", "create", "submit", "checkout", "place", "purchase", "buy", "book", "reserve",
+              "pay", "register", "save", "order", "insert", "post")
+
+
+def _action_elements(html: str) -> list[str]:
+    """The clickable ACTION elements on a page: every `<button ...>...</button>` plus any tag carrying an
+    `onclick=`. Deliberately EXCLUDES plain `<a href>` navigation links (a 'Checkout' nav link is not a
+    create action) so a nav bar never reads as a call-to-action. Lexical scan, no regex."""
+    segs, i = [], 0
+    while True:
+        j = html.find("<button", i)
+        if j == -1:
+            break
+        end = html.find("</button>", j)
+        segs.append(html[j: end + 9] if end != -1 else html[j: j + 400])
+        i = j + 7
+    i = 0
+    while True:                                          # onclick-bearing elements (buttons already caught)
+        j = html.find("onclick", i)
+        if j == -1:
+            break
+        segs.append(html[max(0, j - 120): j + 200])
+        i = j + 7
+    return segs
+
+
+def _dead_cta(html: str, real_paths: set) -> list[str]:
+    """Flag a primary CREATE/PURCHASE call-to-action that never reaches the server — the recurring
+    `onclick="alert('Added to cart!')"` stub, or a page whose buy/checkout BUTTON fires NO write-endpoint
+    fetch. Such a page cannot complete the journey it advertises. The CTA must be an actual action element
+    (a <button> or onclick handler), never a nav link. Lexical, no regex; fed to the regeneration loop as a
+    correction (a false positive costs one retry, and the fallback is a working template)."""
+    cta = [s for s in _action_elements(html) if any(v in s.lower() for v in _CTA_VERBS)]
+    if not cta:
+        return []                                        # no create/purchase ACTION element on this page
+    # A CTA is "served" when the page reaches ANY real backend endpoint — a purchase flow is often
+    # multi-step (get_cart -> initiate_checkout -> capture -> complete), so requiring a specific write-verb
+    # is too brittle (false-positives on legitimate flows). The recurring DEAD case fires NO backend call at
+    # all (an alert()/placeholder). So: a CTA present + the page fetches no real endpoint => dead.
+    fetched = {fp.split("?")[0] for fp in _fetch_paths(html)}
+    if any(p in real_paths for p in fetched):
+        return []                                        # reaches the backend (possibly multi-step) — wired
+    stub = any("alert(" in s.lower() for s in cta)
+    detail = ("a create/purchase button" + (" is an alert()/placeholder stub and" if stub else "")
+              + " triggers NO backend call (the page fetches no real endpoint) — wire its click to call a "
+              + "real endpoint via fetch(..., {method:'POST'}) so the action actually completes")
+    return [detail]
+
+
+# ---- contract-derived ACTION SEAM (supersedes the commerce-verb heuristic when bindings exist) ---------
+# The Architect binds each UX action to the operation that realizes it (handover.interaction_review). The
+# Builder uses those bindings to GUARANTEE, per screen, that every create/update/delete action the design
+# declared has a control wired to its real endpoint — the invariant behind the recurring "no entity created
+# through the UI" failure. Domain-neutral: keyed on the contract's own operations, no shopping vocabulary.
+
+def _required_writes(handover: dict) -> dict:
+    """screen_id -> [binding] for the create/update/delete actions the Architect bound to a real endpoint."""
+    review = handover.get("interaction_review") or {}
+    out: dict = {}
+    for b in (review.get("action_bindings") or []):
+        if b.get("bound") and b.get("kind") in ("create", "update", "delete") and b.get("endpoint"):
+            out.setdefault(b.get("screen"), []).append(b)
+    return out
+
+
+def _ep_param_names(handover: dict) -> dict:
+    """endpoint path -> [param names] from the contract (so an injected fallback form sends real fields)."""
+    return {e["path"]: (e.get("params") or []) for e in _endpoints_from_contract(handover.get("code_contract") or {})}
+
+
+def _unwired_writes(html: str, writes: list) -> list:
+    """Required write-actions whose bound endpoint the page never fetches (the control is missing/dead)."""
+    fetched = {p.split("?")[0] for p in _fetch_paths(html)}
+    return [w for w in writes if w.get("endpoint") not in fetched]
+
+
+#: Per-form wiring script. Uses a LITERAL endpoint (__EP__) so a static fetch-scan detects it as wired and
+#: the form is self-contained. %-template (not an f-string) to keep the JS braces readable.
+_FORM_JS = ('<script>(function(){var f=document.getElementById("__FID__");'
+            'f.addEventListener("submit",function(e){e.preventDefault();'
+            'var q=[].map.call(f.querySelectorAll("input"),function(i){return i.name+"="+encodeURIComponent(i.value)})'
+            '.filter(function(s){return s.slice(-1)!=="="}).join("&");'
+            'fetch("__EP__"+(q?"?"+q:""),{method:"POST"}).then(function(r){return r.text()})'
+            '.then(function(t){f.querySelector("pre").textContent=t;});});})();</script>')
+
+
+def _inject_action_forms(html: str, writes: list, ep_params: dict) -> str:
+    """Last-resort GUARANTEE: for each required write the model still did not wire, inject a minimal REAL
+    form that POSTs the bound endpoint (params in the query string, LITERAL so it's detectable and self-
+    contained). Ugly but functional, so the journey's create can actually fire. Deterministic; used only
+    after the model failed to wire it across retries."""
+    blocks = []
+    for i, w in enumerate(writes):
+        ep = w.get("endpoint") or ""
+        fields = "".join('<input name="%s" placeholder="%s">' % (p, p) for p in ep_params.get(ep, []))
+        label = (w.get("action") or "submit").replace("_", " ").title()
+        fid = "acts%d" % i
+        form = ('<form id="%s"><h3>%s</h3>%s<button type="submit">%s</button><pre></pre></form>'
+                % (fid, label, fields, label))
+        blocks.append(form + _FORM_JS.replace("__FID__", fid).replace("__EP__", ep))
+    inject = ('<section data-action-seam style="max-width:640px;margin:2rem auto;padding:1rem;'
+              'border-top:1px solid #ddd"><p style="color:#888;font-size:.8rem">Actions</p>'
+              + "".join(blocks) + "</section>")
+    low = html.lower()
+    b = low.rfind("</body>")
+    return html[:b] + inject + html[b:] if b != -1 else html + inject
+
+
+
+def _upload_contract_text(upload_eps: dict) -> str:
+    """Spell out each upload endpoint's exact field names for the model. Naming the
+    real parameters is the difference between a working upload and a 422: a generic
+    `fd.append('<param>', ...)` placeholder makes the model invent a name."""
+    if not upload_eps:
+        return ""
+    lines = []
+    for path, spec in sorted(upload_eps.items()):
+        up = ", ".join(spec.get("upload") or [])
+        q = spec.get("query") or []
+        example = ("const fd = new FormData(); "
+                   + "; ".join(f"fd.append('{p}', input.files[0], input.files[0].name)"
+                               for p in (spec.get("upload") or []))
+                   + "; fetch('" + path
+                   + ("?" + "&".join(f"{p}=' + encodeURIComponent(" + p + ") + '" for p in q) if q else "")
+                   + "', {method:'POST', body: fd})  // no Content-Type header")
+        lines.append(f"{path}: file field(s) named EXACTLY [{up}]"
+                     + (f", plus required query param(s) [{', '.join(q)}]" if q else "")
+                     + ". Example: " + example)
+    return "UPLOAD ENDPOINTS AND THEIR EXACT FIELD NAMES — " + "  ".join(lines)
+
+
 def generate(workspace: str, handover: dict, requirements: list[dict], log=print,
              validate=None, max_attempts: int = 3) -> dict:
     """Generate the frontend from the UI requirements + the backend's real endpoints — pages DERIVED
@@ -476,6 +661,12 @@ def generate(workspace: str, handover: dict, requirements: list[dict], log=print
     Returns {pages, generated (clean), broken (failed the gate), fallback}."""
     fe_dir = os.path.join(workspace, "frontend")
     os.makedirs(fe_dir, exist_ok=True)
+    # Parameter names the API binds as multipart uploads — contract-driven, so the
+    # page check below tests the real upload surface rather than guessing at names.
+    _cc = (handover or {}).get("code_contract") or {}
+    upload_params = verify.upload_param_names(_cc)
+    upload_eps = verify.upload_endpoints(_cc)
+    upload_contract = _upload_contract_text(upload_eps)
     # PRODUCT-DRIVEN when the Product Agent has run: pages come from the screen map (user tasks, public
     # vs admin, a real landing), so the app is a product — not an index of the internal modules.
     spec = _load_product_spec(workspace)
@@ -508,11 +699,16 @@ def generate(workspace: str, handover: dict, requirements: list[dict], log=print
     # the REAL backend endpoints — a page must only fetch these (guards against invented paths -> 405)
     real_paths = {e["path"] for e in _endpoints_from_contract(handover.get("code_contract") or {})}
     api_groups = {p.strip("/").split("/")[0] for p in real_paths}
+    # CONTRACT-DERIVED action seam: per screen, the create/update/delete actions the Architect BOUND to a
+    # real endpoint. When present, this supersedes the commerce-verb CTA heuristic (domain-neutral, exact).
+    req_writes = _required_writes(handover)
+    ep_params = _ep_param_names(handover)
 
     built, generated, fallback, broken = [], 0, 0, 0
     for pg in pages:
         slug, title, page_reqs, page_eps = pg["slug"], pg["title"], pg["reqs"], pg["eps"]
-        base_prompt = (_prompt_product(pg, app_name, one_liner, nav_public, nav_admin) if product_mode
+        page_writes = req_writes.get(pg.get("screen_id"), [])
+        base_prompt = (_prompt_product(pg, app_name, one_liner, nav_public, nav_admin, upload_contract) if product_mode
                        else _prompt(title, app_name, page_reqs, page_eps))
         html, clean, correction = None, False, ""
         for attempt in range(max_attempts):
@@ -531,14 +727,51 @@ def generate(workspace: str, handover: dict, requirements: list[dict], log=print
             if invented and attempt < max_attempts - 1:
                 correction = ("\n\nCORRECTION — you called endpoints that DO NOT EXIST and will 404/405: "
                               + ", ".join(invented[:6]) + ". Call ONLY these real endpoints (HTTP POST, "
-                              "params in the query string): " + ", ".join(sorted(real_paths)[:50])
+                              "scalar params in the query string, but a FILE/IMAGE payload in the BODY as "
+                              "multipart/form-data): " + ", ".join(sorted(real_paths)[:50])
                               + ". Remove the invented calls (or replace with a real endpoint above); if "
                               "no endpoint provides some data, render an empty state instead of inventing one.")
                 log(f"  [frontend] {slug}: invented endpoints {invented[:4]} — retry")
                 continue
+            # ACTION SEAM: when the Architect bound this screen's write actions to endpoints, require a
+            # control wired to EACH (catches a missing button, not just a dead stub). Otherwise fall back to
+            # the commerce-verb dead-CTA heuristic (no product spec / no bindings available).
+            if page_writes:
+                unwired = _unwired_writes(cand, page_writes)
+                dead = [f"POST {w['endpoint']} for the '{w.get('action')}' action ({w.get('kind')} {w.get('entity')})"
+                        for w in unwired]
+            else:
+                dead = _dead_cta(cand, real_paths)
+            # UPLOAD PAYLOAD IN THE URL: the router binds an upload as multipart, but a page
+            # that still puts the bytes in the query string overflows the request line and the
+            # upload fails anyway. The prompt says not to; the model does it regardless — so
+            # reject it deterministically instead of hoping (verify.frontend_payload_hygiene).
+            payload_bad = (verify.frontend_payload_hygiene_text(cand, upload_params, f"{slug}.html")
+                           + verify.frontend_upload_fields(cand, upload_eps, f"{slug}.html"))
+            if payload_bad and attempt < max_attempts - 1:
+                correction = ("\n\nCORRECTION — the file upload on this page is wrong: "
+                              + "; ".join(f["message"] for f in payload_bad[:3])
+                              + ". " + _upload_contract_text(upload_eps)
+                              + " The multipart field name MUST equal the parameter name exactly — "
+                              "FastAPI matches parts to parameters BY NAME — and the file must never "
+                              "appear in the URL.")
+                log(f"  [frontend] {slug}: file payload in the URL — retry")
+                continue
+
+            if dead and attempt < max_attempts - 1:
+                correction = ("\n\nCORRECTION — this screen is missing a working control for a required "
+                              "action. The user MUST be able to: " + "; ".join(dead[:3]) + ". Add a clear "
+                              "button/form whose handler calls that exact endpoint via "
+                              "fetch(path, {method:'POST'}) with SCALAR params in the query string — a "
+                              "file/image payload goes in the BODY (FormData), never the URL. Never use "
+                              "alert()/console/a placeholder, and never leave the action inert.")
+                log(f"  [frontend] {slug}: unwired action(s) {dead[:1]} — retry")
+                continue
             errs = validate(slug, cand) if validate else []
             if invented:
                 errs = list(errs) + [f"invented endpoints: {invented[:4]}"]
+            if dead:
+                errs = list(errs) + [f"dead CTA: {dead[:1]}"]
             if not errs:
                 clean = True
                 break
@@ -549,6 +782,15 @@ def generate(workspace: str, handover: dict, requirements: list[dict], log=print
             generated += 1
         else:
             broken += 1
+        # GUARANTEE: if the model still didn't wire a required create/update/delete action after all retries,
+        # inject a minimal REAL form that POSTs its bound endpoint — so the journey's create can fire by
+        # construction, never left to chance. Deterministic, contract-derived; a no-op when everything is wired.
+        if page_writes and html is not None:
+            still = _unwired_writes(html, page_writes)
+            if still:
+                html = _inject_action_forms(html, still, ep_params)
+                log(f"  [frontend] {slug}: action-seam injected {len(still)} wired control(s): "
+                    f"{[w.get('action') for w in still]}")
         with open(os.path.join(fe_dir, f"{slug}.html"), "w", encoding="utf-8") as f:
             f.write(html)
         built.append({"page": slug, "title": title, "reqs": [r["req_id"] for r in page_reqs]})
@@ -577,7 +819,7 @@ def generate(workspace: str, handover: dict, requirements: list[dict], log=print
 
 
 def regenerate_page(workspace: str, handover: dict, requirements: list[dict], slug: str,
-                    report: str = "", log=print) -> dict:
+                    report: str = "", log=print, validate=None) -> dict:
     """Regenerate ONE flagged page (the Testing->Development frontend loop). Rebuilds the page from its
     product screen with skills injected + the invented-endpoint guardrail + the tester's failure report as
     an explicit correction, so a dead button / dead link / invented endpoint / non-completing flow is
@@ -595,7 +837,8 @@ def regenerate_page(workspace: str, handover: dict, requirements: list[dict], sl
     correction = ("\n\nTHIS PAGE FAILED functional testing — FIX IT. Tester report:\n" + report[:1200]
                   + "\n\nEvery button/link/control MUST actually work (perform its action, call a REAL "
                   "endpoint, advance the UI) — no dead no-op, no placeholder alert, no invented endpoint.")
-    base_prompt = _prompt_product(pg, app_name, spec.get("one_liner", ""), nav_public, nav_admin) + correction
+    base_prompt = _prompt_product(pg, app_name, spec.get("one_liner", ""), nav_public, nav_admin,
+                                  verify.upload_contract_for(workspace)) + correction
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     deadline = float(os.environ.get("FRONTEND_PAGE_TIMEOUT", "200"))
     html, extra = None, ""
@@ -611,6 +854,17 @@ def regenerate_page(workspace: str, handover: dict, requirements: list[dict], sl
         if invented and attempt < 2:
             extra = ("\n\nCORRECTION — these endpoints DO NOT EXIST: " + ", ".join(invented[:6])
                      + ". Call ONLY: " + ", ".join(sorted(real_paths)[:50]))
+            continue
+        # RENDER + JS-CHECK the candidate (same gate generate uses): the fix-loop must not ship a page with
+        # a load-time JS error (e.g. a var used outside the scope it was declared in) or a dead control —
+        # that is exactly the class of bug the loop is meant to FIX, so a regen that reintroduces one has to
+        # retry, not ship. Without this the loop can oscillate forever on a page it keeps breaking.
+        errs = validate(pg["slug"], cand) if validate else []
+        if errs and attempt < 2:
+            extra = ("\n\nTHE PAGE YOU JUST WROTE FAILED to render cleanly — fix these JS/console errors "
+                     "(e.g. a variable declared inside DOMContentLoaded but used outside it must be declared "
+                     "in the same scope as its use): " + "; ".join(errs[:4]))
+            log(f"  [regen] {pg['slug']}: render errors {errs[:2]} — retry")
             continue
         break
     ex.shutdown(wait=False)
